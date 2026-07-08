@@ -1,4 +1,5 @@
 mod convert;
+mod lora;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -113,12 +114,6 @@ impl Drop for AdmissionGuard {
     }
 }
 
-fn unimplemented<T>(method: &str) -> Result<Response<T>, Status> {
-    Err(Status::unimplemented(format!(
-        "engine RPC method `{method}` is not implemented"
-    )))
-}
-
 fn health_check(name: &str, state: pb::HealthState, message: Option<String>) -> pb::HealthCheck {
     pb::HealthCheck {
         name: name.to_string(),
@@ -139,6 +134,7 @@ impl pb::engine_server::Engine for EngineServiceImpl {
             self.try_admit().ok_or_else(|| Status::unavailable("engine RPC is draining"))?;
 
         let proto_request = request.into_inner();
+        let lora_name = proto_request.lora_name.clone();
         let role = convert::role_from_kv_role(self.ready().kv_role.as_deref());
         let handoff_dp_rank = convert::validate_disaggregated_request(
             &proto_request,
@@ -150,6 +146,25 @@ impl pb::engine_server::Engine for EngineServiceImpl {
         let media_parts = convert::media_parts_from_request(&proto_request.media)?;
         let mut text_request =
             convert::to_text_request(proto_request, self.state.served_model_names())?;
+
+        let mut lora_lease = None;
+        if !lora_name.is_empty() {
+            if !self.ready().supports_lora {
+                return Err(Status::failed_precondition(
+                    "engine was not started with LoRA enabled",
+                ));
+            }
+            let mut resolution = self.state.resolve_model_with_loras(Some(&lora_name)).await;
+            lora_lease = resolution.lease.take();
+            if !self.state.lora_state_is_consistent() {
+                return Err(Status::failed_precondition(
+                    "LoRA state differs across engine ranks; restart the engine",
+                ));
+            }
+            text_request.lora_request = Some(resolution.lora_request.ok_or_else(|| {
+                Status::not_found(format!("LoRA adapter `{lora_name}` is not loaded"))
+            })?);
+        }
 
         if !media_parts.is_empty() {
             let Prompt::TokenIds(mut token_ids) = text_request.prompt else {
@@ -180,6 +195,7 @@ impl pb::engine_server::Engine for EngineServiceImpl {
             .generate(text_request)
             .await
             .map_err(|error| Status::internal(error.to_report_string()))?;
+        let stream = crate::lora::hold_lora_lease(stream, lora_lease);
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
@@ -247,10 +263,10 @@ impl pb::engine_server::Engine for EngineServiceImpl {
             max_running_requests: ready.max_num_seqs,
             max_batched_tokens: ready.max_num_batched_tokens,
             tokenizer_modes: Vec::new(),
-            max_loras: 0,
+            max_loras: ready.max_loras,
             supports_text_input: true,
             supports_token_ids_input: true,
-            supports_lora: false,
+            supports_lora: ready.supports_lora,
             supports_multimodal: self.state.chat.supports_multimodal(),
             reasoning_parser: self
                 .state
@@ -286,6 +302,14 @@ impl pb::engine_server::Engine for EngineServiceImpl {
             client.health_error().map(|error| error.to_report_string()),
         )];
         let mut overall = engine_state;
+        if self.ready().supports_lora && !self.state.lora_state_is_consistent() {
+            checks.push(health_check(
+                "lora",
+                pb::HealthState::NotReady,
+                Some("adapter state differs across engine ranks; restart required".to_string()),
+            ));
+            overall = pb::HealthState::NotReady;
+        }
         if request.include_inference_probe && overall == pb::HealthState::Ready {
             if let Some(_guard) = self.try_admit() {
                 let (probe_state, message) = self.run_inference_probe(&request.model).await;
@@ -348,23 +372,27 @@ impl pb::engine_server::Engine for EngineServiceImpl {
 
     async fn load_lora(
         &self,
-        _request: Request<pb::LoadLoraRequest>,
+        request: Request<pb::LoadLoraRequest>,
     ) -> Result<Response<pb::LoadLoraResponse>, Status> {
-        unimplemented("LoadLora")
+        let _guard =
+            self.try_admit().ok_or_else(|| Status::unavailable("engine RPC is draining"))?;
+        lora::load_lora(&self.state, request).await
     }
 
     async fn unload_lora(
         &self,
-        _request: Request<pb::UnloadLoraRequest>,
+        request: Request<pb::UnloadLoraRequest>,
     ) -> Result<Response<pb::UnloadLoraResponse>, Status> {
-        unimplemented("UnloadLora")
+        let _guard =
+            self.try_admit().ok_or_else(|| Status::unavailable("engine RPC is draining"))?;
+        lora::unload_lora(&self.state, request).await
     }
 
     async fn list_loras(
         &self,
-        _request: Request<pb::ListLorasRequest>,
+        request: Request<pb::ListLorasRequest>,
     ) -> Result<Response<pb::ListLorasResponse>, Status> {
-        unimplemented("ListLoras")
+        lora::list_loras(&self.state, request).await
     }
 
     async fn get_kv_connector_info(

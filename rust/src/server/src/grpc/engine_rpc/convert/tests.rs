@@ -84,15 +84,13 @@ fn request_conversion_rejects_missing_input_and_wrong_model() {
 }
 
 #[test]
-fn request_conversion_still_rejects_lora_selection() {
+fn request_conversion_leaves_lora_resolution_to_service() {
     let request = pb::GenerateRequest {
         lora_name: "adapter".to_string(),
         ..base_request()
     };
-    assert_eq!(
-        to_text_request(request, &["test-model".to_string()]).unwrap_err().code(),
-        tonic::Code::Unimplemented
-    );
+    let text = to_text_request(request, &["test-model".to_string()]).unwrap();
+    assert!(text.lora_request.is_none());
 }
 
 #[test]

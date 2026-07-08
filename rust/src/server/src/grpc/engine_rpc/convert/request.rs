@@ -15,11 +15,6 @@ pub fn to_text_request(
             req.model
         )));
     }
-    if !req.lora_name.is_empty() {
-        return Err(Status::unimplemented(
-            "LoRA request selection is not implemented",
-        ));
-    }
     let prompt = match req.input {
         Some(pb::generate_request::Input::Prompt(text)) => Prompt::Text(text),
         Some(pb::generate_request::Input::TokenIds(ids)) => Prompt::TokenIds(ids.ids),

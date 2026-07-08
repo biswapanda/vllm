@@ -11,13 +11,17 @@ use vllm_chat::{
     DynChatOutputProcessor, DynChatRenderer, NewChatOutputProcessorOptions, ParserSelection,
     RenderedPrompt,
 };
-use vllm_engine_core_client::mock_engine::default_ready_response;
+use vllm_engine_core_client::mock_engine::{MockEngineConfig, default_ready_response};
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
+    UtilityCallOutput,
 };
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
-use vllm_engine_core_client::test_utils::{IpcNamespace, spawn_mock_engine_task};
+use vllm_engine_core_client::protocol::utility::{UtilityOutput, UtilityResultEnvelope};
+use vllm_engine_core_client::test_utils::{
+    IpcNamespace, spawn_mock_engine_task, spawn_mock_engine_task_with_config,
+};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, EngineId};
 use vllm_llm::Llm;
 use vllm_text::tokenizer::{DynTokenizer, Tokenizer};
@@ -32,6 +36,7 @@ use crate::state::AppState;
 mod discovery;
 mod generate;
 mod lifecycle;
+mod lora;
 mod media;
 mod topology;
 
@@ -324,4 +329,126 @@ fn base_request() -> pb::GenerateRequest {
         stream: true,
         ..Default::default()
     }
+}
+
+async fn lora_scripted_test_server<F>(
+    supports_lora: bool,
+    run: F,
+) -> (
+    EngineClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<()>,
+    MockEngineTask,
+)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let mut ready = default_ready_response();
+    ready.supports_lora = supports_lora;
+    ready.max_loras = if supports_lora { 4 } else { 0 };
+    let config = MockEngineConfig {
+        local: true,
+        headless: true,
+        ready_response: ready,
+        ..Default::default()
+    };
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_config(
+        handshake_address.clone(),
+        vec![0x00, 0x00],
+        config,
+        run,
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(
+        test_llm(client),
+        Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
+    );
+    let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
+    let engine_rpc = EngineServer::new(EngineServiceImpl::new(state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        TonicServer::builder()
+            .add_service(engine_rpc)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    (EngineClient::new(channel), server_task, engine_task)
+}
+
+async fn lora_test_server(
+    supports_lora: bool,
+    unload_result: bool,
+) -> (
+    EngineClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<()>,
+    MockEngineTask,
+) {
+    lora_scripted_test_server(supports_lora, move |dealer, push| {
+        boxed_test_future(async move {
+            let load = recv_engine_message(dealer).await;
+            assert_eq!(load[0].as_ref(), &[0x03]);
+            let load: rmpv::Value = rmp_serde::from_slice(&load[1]).unwrap();
+            let load = load.as_array().expect("load utility tuple");
+            assert_eq!(load[2], rmpv::Value::from("add_lora"));
+            send_utility_bool(push, load[1].as_u64().unwrap(), true).await;
+
+            let add = recv_engine_message(dealer).await;
+            assert_eq!(add[0].as_ref(), &[0x00]);
+            let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
+            let lora = request.lora_request.expect("LoRA request");
+            assert_eq!(lora.lora_name, "adapter-a");
+            assert_eq!(lora.lora_int_id, 17);
+            send_outputs(
+                push,
+                engine_outputs_for_request(&request.request_id, default_stream_output_specs()),
+            )
+            .await;
+
+            let unload = recv_engine_message(dealer).await;
+            assert_eq!(unload[0].as_ref(), &[0x03]);
+            let unload: rmpv::Value = rmp_serde::from_slice(&unload[1]).unwrap();
+            let unload = unload.as_array().expect("unload utility tuple");
+            assert_eq!(unload[2], rmpv::Value::from("remove_lora"));
+            send_utility_bool(push, unload[1].as_u64().unwrap(), unload_result).await;
+        })
+    })
+    .await
+}
+
+async fn send_utility_bool(push: &mut PushSocket, call_id: u64, result: bool) {
+    send_outputs(
+        push,
+        UtilityCallOutput {
+            engine_index: 0,
+            timestamp: 0.0,
+            output: UtilityOutput {
+                call_id: call_id.into(),
+                failure_message: None,
+                result: Some(UtilityResultEnvelope::without_type_info(rmpv::Value::from(
+                    result,
+                ))),
+            },
+        }
+        .into(),
+    )
+    .await;
 }
