@@ -2,6 +2,7 @@
 
 mod convert;
 pub mod engine_rpc;
+mod struct_json;
 
 use std::pin::Pin;
 use std::sync::Arc;

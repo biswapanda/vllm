@@ -3,6 +3,7 @@ use uuid::Uuid;
 use vllm_text::{Prompt, SamplingParams, TextDecodeOptions, TextRequest};
 
 use super::super::pb;
+use crate::grpc::struct_json::prost_struct_to_json;
 
 pub fn to_text_request(
     req: pb::GenerateRequest,
@@ -19,15 +20,6 @@ pub fn to_text_request(
             "LoRA request selection is not implemented",
         ));
     }
-    if req.kv_session.is_some() {
-        return Err(Status::unimplemented("KV sessions are not implemented"));
-    }
-    if req.data_parallel_rank.is_some() {
-        return Err(Status::unimplemented(
-            "forced data-parallel routing is not implemented",
-        ));
-    }
-
     let prompt = match req.input {
         Some(pb::generate_request::Input::Prompt(text)) => Prompt::Text(text),
         Some(pb::generate_request::Input::TokenIds(ids)) => Prompt::TokenIds(ids.ids),
@@ -64,6 +56,18 @@ pub fn to_text_request(
         sampling_params.stop_token_ids = Some(stop_token_ids);
     }
 
+    if let Some(attributes) = req
+        .kv_session
+        .as_ref()
+        .and_then(|session| session.attributes_struct.as_ref())
+        .filter(|attributes| !attributes.fields.is_empty())
+    {
+        sampling_params.vllm_xargs.get_or_insert_with(Default::default).insert(
+            "kv_transfer_params".to_string(),
+            prost_struct_to_json(attributes),
+        );
+    }
+
     Ok(TextRequest {
         request_id,
         prompt,
@@ -79,7 +83,7 @@ pub fn to_text_request(
         priority: req.priority.unwrap_or(0),
         cache_salt: None,
         add_special_tokens: true,
-        data_parallel_rank: None,
+        data_parallel_rank: req.data_parallel_rank,
         reasoning_parser_kwargs: None,
         lora_request: None,
         arrival_time: None,

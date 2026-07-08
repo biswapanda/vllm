@@ -11,6 +11,8 @@ use vllm_chat::{
     DynChatOutputProcessor, DynChatRenderer, NewChatOutputProcessorOptions, ParserSelection,
     RenderedPrompt,
 };
+use vllm_engine_core_client::mock_engine::default_ready_response;
+use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
 };

@@ -119,14 +119,6 @@ fn unimplemented<T>(method: &str) -> Result<Response<T>, Status> {
     )))
 }
 
-fn role_from_kv_role(kv_role: Option<&str>) -> pb::EngineRole {
-    match kv_role {
-        Some("kv_producer") => pb::EngineRole::Prefill,
-        Some("kv_consumer") => pb::EngineRole::Decode,
-        _ => pb::EngineRole::Aggregated,
-    }
-}
-
 fn health_check(name: &str, state: pb::HealthState, message: Option<String>) -> pb::HealthCheck {
     pb::HealthCheck {
         name: name.to_string(),
@@ -147,6 +139,14 @@ impl pb::engine_server::Engine for EngineServiceImpl {
             self.try_admit().ok_or_else(|| Status::unavailable("engine RPC is draining"))?;
 
         let proto_request = request.into_inner();
+        let role = convert::role_from_kv_role(self.ready().kv_role.as_deref());
+        let handoff_dp_rank = convert::validate_disaggregated_request(
+            &proto_request,
+            role,
+            self.ready().kv_connector.as_deref(),
+            self.ready().data_parallel_size,
+            self.ready().data_parallel_rank,
+        )?;
         let media_parts = convert::media_parts_from_request(&proto_request.media)?;
         let mut text_request =
             convert::to_text_request(proto_request, self.state.served_model_names())?;
@@ -169,6 +169,10 @@ impl pb::engine_server::Engine for EngineServiceImpl {
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "engine_rpc generate");
+        let kv_connector = self.ready().kv_connector.clone();
+        if role == pb::EngineRole::Prefill {
+            convert::mark_prefill_request(&mut text_request);
+        }
         let stream = self
             .state
             .chat
@@ -183,7 +187,13 @@ impl pb::engine_server::Engine for EngineServiceImpl {
             futures::pin_mut!(stream);
             while let Some(event) = stream.next().await {
                 let responses = match event {
-                    Ok(event) => convert::event_to_responses(event, &request_id),
+                    Ok(event) => convert::event_to_responses(
+                        event,
+                        &request_id,
+                        role,
+                        kv_connector.as_deref(),
+                        handoff_dp_rank,
+                    ),
                     Err(error) => {
                         let response =
                             convert::error_response(&request_id, error.to_report_string());
@@ -211,7 +221,7 @@ impl pb::engine_server::Engine for EngineServiceImpl {
             engine_name: "vllm".to_string(),
             engine_version: ready.vllm_version.clone(),
             api_version: ENGINE_RPC_API_VERSION.to_string(),
-            role: role_from_kv_role(ready.kv_role.as_deref()) as i32,
+            role: convert::role_from_kv_role(ready.kv_role.as_deref()) as i32,
             instance_id: ready.kv_engine_id.clone().unwrap_or_default(),
             supported_models: self.state.served_model_names().to_vec(),
             parallelism: Some(self.parallelism_info()),
@@ -232,7 +242,7 @@ impl pb::engine_server::Engine for EngineServiceImpl {
             served_model_aliases: served.iter().skip(1).cloned().collect(),
             max_context_length: client.max_model_len(),
             max_output_tokens: 0,
-            kv_block_size: ready.block_size.min(u64::from(u32::MAX)) as u32,
+            kv_block_size: ready.kv_event_block_size.min(u64::from(u32::MAX)) as u32,
             total_kv_blocks: self.per_rank_kv_blocks(),
             max_running_requests: ready.max_num_seqs,
             max_batched_tokens: ready.max_num_batched_tokens,
@@ -361,14 +371,21 @@ impl pb::engine_server::Engine for EngineServiceImpl {
         &self,
         _request: Request<pb::GetKvConnectorInfoRequest>,
     ) -> Result<Response<pb::KvConnectorInfo>, Status> {
-        unimplemented("GetKvConnectorInfo")
+        Ok(Response::new(self.kv_connector_info()))
     }
 
     async fn get_kv_event_sources(
         &self,
         _request: Request<pb::GetKvEventSourcesRequest>,
     ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
-        unimplemented("GetKvEventSources")
+        let responses = self.state.engine_core_client().ready_responses();
+        let ranked = responses
+            .into_iter()
+            .map(|response| (response.data_parallel_rank, response))
+            .collect::<Vec<_>>();
+        Ok(Response::new(pb::GetKvEventSourcesResponse {
+            sources: build_kv_event_sources(&ranked),
+        }))
     }
 }
 
@@ -417,6 +434,72 @@ impl EngineServiceImpl {
             ),
         }
     }
+}
+
+fn offset_endpoint_port(endpoint: &str, data_parallel_rank: u32) -> String {
+    if data_parallel_rank == 0 || endpoint.is_empty() {
+        return endpoint.to_string();
+    }
+    if endpoint.contains("inproc") {
+        return format!("{endpoint}_dp{data_parallel_rank}");
+    }
+    if endpoint.contains("tcp")
+        && let Some((base_addr, port)) = endpoint.rsplit_once(':')
+        && let Ok(base_port) = port.parse::<u32>()
+    {
+        return format!("{base_addr}:{}", base_port + data_parallel_rank);
+    }
+    endpoint.to_string()
+}
+
+fn build_kv_event_sources(
+    ready_responses: &[(u32, &EngineCoreReadyResponse)],
+) -> Vec<pb::KvEventSource> {
+    ready_responses
+        .iter()
+        .filter(|(_, response)| response.kv_events_publisher.as_deref() == Some("zmq"))
+        .filter_map(|(rank, response)| {
+            let base = response.kv_events_endpoint.as_ref()?;
+            let endpoint = offset_endpoint_port(base, *rank);
+            let endpoint_addr = kv_endpoint_from_zmq(&endpoint)?;
+            Some(pb::KvEventSource {
+                transport: "zmq".to_string(),
+                endpoint_addr: Some(endpoint_addr),
+                topic: response.kv_events_topic.clone().unwrap_or_default(),
+                replay_endpoint: String::new(),
+                data_parallel_rank: *rank,
+                encoding: "msgpack".to_string(),
+                schema_version: 1,
+                buffer_steps: 0,
+                hwm: 0,
+                max_queue_size: 0,
+            })
+        })
+        .collect()
+}
+
+fn kv_endpoint_from_zmq(endpoint: &str) -> Option<pb::KvEndpoint> {
+    let rest = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
+    let (host, port) = rest.rsplit_once(':')?;
+    let port: u32 = port.parse().ok()?;
+    let host = match host.trim_matches(|character| character == '[' || character == ']') {
+        "*" | "0.0.0.0" | "::" | "" => advertise_host(),
+        concrete => concrete.to_string(),
+    };
+    Some(pb::KvEndpoint {
+        host,
+        port,
+        protocol: "tcp".to_string(),
+    })
+}
+
+fn advertise_host() -> String {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("10.255.255.255:1")?;
+            Ok(socket.local_addr()?.ip().to_string())
+        })
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
 #[cfg(test)]

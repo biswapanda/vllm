@@ -367,11 +367,15 @@ class EngineCoreReadyResponse:
     data_parallel_rank: int
     max_num_seqs: int
     max_num_batched_tokens: int
+    kv_event_block_size: int
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
     kv_connector: str | None = None
     kv_role: str | None = None
     kv_engine_id: str | None = None
+    kv_events_publisher: str | None = None
+    kv_events_endpoint: str | None = None
+    kv_events_topic: str | None = None
 
 
 ready_response = EngineCoreReadyResponse(
@@ -391,6 +395,10 @@ ready_response = EngineCoreReadyResponse(
     kv_connector="NixlConnector",
     kv_role="kv_both",
     kv_engine_id="engine-0",
+    kv_events_publisher="zmq",
+    kv_events_endpoint="tcp://127.0.0.1:5557",
+    kv_events_topic="kv",
+    kv_event_block_size=256,
 )
 
 print(msgspec.msgpack.encode(request).hex())

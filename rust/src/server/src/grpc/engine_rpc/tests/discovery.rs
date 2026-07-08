@@ -66,3 +66,63 @@ async fn model_info_reports_effective_parser_names() {
     assert_eq!(info.reasoning_parser, "deepseek_r1");
     server_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn kv_connector_info_is_disabled_without_connector() {
+    let (mut client, server_task, _engine_task) =
+        engine_rpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
+    let info = client
+        .get_kv_connector_info(pb::GetKvConnectorInfoRequest {})
+        .await
+        .expect("get_kv_connector_info")
+        .into_inner();
+    assert!(!info.enabled);
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn kv_event_sources_are_empty_without_publisher() {
+    let (mut client, server_task, _engine_task) =
+        engine_rpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
+    let response = client
+        .get_kv_event_sources(pb::GetKvEventSourcesRequest {})
+        .await
+        .expect("get_kv_event_sources")
+        .into_inner();
+    assert!(response.sources.is_empty());
+    server_task.abort();
+}
+
+fn ready_with_kv_events(
+    dp_rank: u32,
+    publisher: Option<&str>,
+    endpoint: Option<&str>,
+) -> EngineCoreReadyResponse {
+    EngineCoreReadyResponse {
+        data_parallel_rank: dp_rank,
+        kv_events_publisher: publisher.map(str::to_string),
+        kv_events_endpoint: endpoint.map(str::to_string),
+        kv_events_topic: Some("kv".to_string()),
+        ..default_ready_response()
+    }
+}
+
+#[test]
+fn kv_event_sources_fall_back_to_per_rank_publishers() {
+    let rank_zero = ready_with_kv_events(0, Some("zmq"), Some("tcp://*:5557"));
+    let rank_one = ready_with_kv_events(1, Some("zmq"), Some("tcp://*:5557"));
+    let sources = super::super::build_kv_event_sources(&[(0, &rank_zero), (1, &rank_one)]);
+    let ports: Vec<u32> = sources
+        .iter()
+        .map(|source| source.endpoint_addr.as_ref().unwrap().port)
+        .collect();
+    assert_eq!(ports, vec![5557, 5558]);
+}
+
+#[test]
+fn kv_event_sources_are_empty_without_any_publisher() {
+    let ready = ready_with_kv_events(0, None, None);
+    assert!(super::super::build_kv_event_sources(&[(0, &ready)]).is_empty());
+}
