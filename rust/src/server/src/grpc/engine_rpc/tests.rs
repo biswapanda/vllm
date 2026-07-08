@@ -1,11 +1,3 @@
-//! Wire-shape tests for the engine RPC v1 gRPC service.
-//!
-//! These mirror [`crate::grpc::tests`] (the `vllm` Generate service tests):
-//! they stand up the tonic engine RPC service over the shared [`AppState`],
-//! backed by the `mock-engine` test double, and assert the engine RPC wire shape
-//! for the happy-path stream, abort, drain, and the discovery RPCs. Real-engine
-//! coverage lives in the cluster smoke matrix (plan Phase 5).
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
