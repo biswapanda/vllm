@@ -1,11 +1,18 @@
+mod convert;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use thiserror_ext::AsReport as _;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use tracing::info;
+use uuid::Uuid;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
+use vllm_text::{Prompt, SamplingParams, TextDecodeOptions, TextOutputStreamExt as _, TextRequest};
 
 use crate::state::AppState;
 
@@ -16,6 +23,7 @@ pub mod pb {
 pub use pb::engine_server::EngineServer;
 
 const ENGINE_RPC_API_VERSION: &str = "vllm.engine.v1";
+const INFERENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -133,11 +141,65 @@ impl pb::engine_server::Engine for EngineServiceImpl {
 
     async fn generate(
         &self,
-        _request: Request<pb::GenerateRequest>,
+        request: Request<pb::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let _guard =
+        let guard =
             self.try_admit().ok_or_else(|| Status::unavailable("engine RPC is draining"))?;
-        unimplemented("Generate")
+
+        let proto_request = request.into_inner();
+        let media_parts = convert::media_parts_from_request(&proto_request.media)?;
+        let mut text_request =
+            convert::to_text_request(proto_request, self.state.served_model_names())?;
+
+        if !media_parts.is_empty() {
+            let Prompt::TokenIds(mut token_ids) = text_request.prompt else {
+                return Err(Status::invalid_argument(
+                    "multimodal engine RPC requests must provide token_ids input; placeholder markers are expanded engine-side",
+                ));
+            };
+            let mm_features = self
+                .state
+                .chat
+                .prepare_media(media_parts, &mut token_ids)
+                .await
+                .map_err(|error| Status::internal(error.to_report_string()))?;
+            text_request.prompt = Prompt::TokenIds(token_ids);
+            text_request.mm_features = mm_features;
+        }
+
+        let request_id = text_request.request_id.clone();
+        info!(%request_id, "engine_rpc generate");
+        let stream = self
+            .state
+            .chat
+            .text()
+            .generate(text_request)
+            .await
+            .map_err(|error| Status::internal(error.to_report_string()))?;
+
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let _guard = guard;
+            futures::pin_mut!(stream);
+            while let Some(event) = stream.next().await {
+                let responses = match event {
+                    Ok(event) => convert::event_to_responses(event, &request_id),
+                    Err(error) => {
+                        let response =
+                            convert::error_response(&request_id, error.to_report_string());
+                        let _ = tx.send(Ok(response)).await;
+                        break;
+                    }
+                };
+                for response in responses {
+                    if tx.send(Ok(response)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn get_engine_info(
@@ -199,24 +261,35 @@ impl pb::engine_server::Engine for EngineServiceImpl {
         &self,
         request: Request<pb::HealthRequest>,
     ) -> Result<Response<pb::HealthResponse>, Status> {
-        if request.into_inner().include_inference_probe {
-            return unimplemented("Health inference probe");
-        }
+        let request = request.into_inner();
         let client = self.state.engine_core_client();
-        let state = if !client.is_healthy() {
+        let engine_state = if !client.is_healthy() {
             pb::HealthState::NotReady
         } else if self.is_draining() {
             pb::HealthState::Draining
         } else {
             pb::HealthState::Ready
         };
+        let mut checks = vec![health_check(
+            "engine",
+            engine_state,
+            client.health_error().map(|error| error.to_report_string()),
+        )];
+        let mut overall = engine_state;
+        if request.include_inference_probe && overall == pb::HealthState::Ready {
+            if let Some(_guard) = self.try_admit() {
+                let (probe_state, message) = self.run_inference_probe(&request.model).await;
+                if probe_state != pb::HealthState::Ready {
+                    overall = pb::HealthState::Degraded;
+                }
+                checks.push(health_check("inference_probe", probe_state, message));
+            } else {
+                overall = pb::HealthState::Draining;
+            }
+        }
         Ok(Response::new(pb::HealthResponse {
-            state: state as i32,
-            checks: vec![health_check(
-                "engine",
-                state,
-                client.health_error().map(|error| error.to_report_string()),
-            )],
+            state: overall as i32,
+            checks,
         }))
     }
 
@@ -296,6 +369,53 @@ impl pb::engine_server::Engine for EngineServiceImpl {
         _request: Request<pb::GetKvEventSourcesRequest>,
     ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
         unimplemented("GetKvEventSources")
+    }
+}
+
+impl EngineServiceImpl {
+    async fn run_inference_probe(&self, model: &str) -> (pb::HealthState, Option<String>) {
+        if !model.is_empty() && !self.state.served_model_names().iter().any(|name| name == model) {
+            return (
+                pb::HealthState::Degraded,
+                Some(format!("model `{model}` not found")),
+            );
+        }
+
+        let request = TextRequest {
+            request_id: format!("engine_rpc-health-{}", Uuid::new_v4()),
+            prompt: Prompt::Text("hi".to_string()),
+            mm_features: None,
+            sampling_params: SamplingParams {
+                temperature: Some(0.0),
+                max_tokens: Some(1),
+                ..SamplingParams::default()
+            },
+            decode_options: TextDecodeOptions::default(),
+            intermediate: false,
+            priority: 0,
+            cache_salt: None,
+            add_special_tokens: true,
+            data_parallel_rank: None,
+            reasoning_parser_kwargs: None,
+            lora_request: None,
+            arrival_time: None,
+        };
+
+        let probe = async {
+            let stream = self.state.chat.text().generate(request).await?;
+            stream.collect_output().await
+        };
+        match tokio::time::timeout(INFERENCE_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(_)) => (pb::HealthState::Ready, None),
+            Ok(Err(error)) => (pb::HealthState::Degraded, Some(error.to_report_string())),
+            Err(_) => (
+                pb::HealthState::Degraded,
+                Some(format!(
+                    "inference probe timed out after {}s",
+                    INFERENCE_PROBE_TIMEOUT.as_secs()
+                )),
+            ),
+        }
     }
 }
 

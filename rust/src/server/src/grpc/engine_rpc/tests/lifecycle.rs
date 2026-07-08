@@ -13,17 +13,20 @@ async fn health_reports_ready_without_probe() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn health_probe_is_unimplemented_until_generation_lands() {
-    let (mut client, server_task, _engine_task) =
+async fn health_probe_generates_one_token() {
+    let (mut client, server_task, engine_task) =
         engine_rpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
-    let status = client
+    let response = client
         .health(pb::HealthRequest {
             include_inference_probe: true,
             ..Default::default()
         })
         .await
-        .expect_err("probe must remain unimplemented");
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
+        .expect("health probe")
+        .into_inner();
+    assert_eq!(response.state, pb::HealthState::Ready as i32);
+    assert!(response.checks.iter().any(|check| check.name == "inference_probe"));
+    engine_task.await.expect("mock engine task");
     server_task.abort();
 }
 

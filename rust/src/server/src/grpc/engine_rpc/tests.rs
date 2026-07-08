@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use futures::StreamExt as _;
 use serial_test::serial;
 use tonic::transport::Server as TonicServer;
 use vllm_chat::{
@@ -27,7 +28,9 @@ use super::{EngineServer, EngineServiceImpl, pb};
 use crate::state::AppState;
 
 mod discovery;
+mod generate;
 mod lifecycle;
+mod media;
 mod topology;
 
 // ========================================================================================
@@ -261,6 +264,8 @@ async fn engine_rpc_test_server_with_parsers(
                 let add = recv_engine_message(dealer).await;
                 let request: EngineCoreRequest =
                     rmp_serde::from_slice(&add[1]).expect("decode request");
+                assert!(request.arrival_time.is_finite());
+                assert!(request.arrival_time > 0.0);
                 send_outputs(
                     push,
                     engine_outputs_for_request(&request.request_id, output_specs),
