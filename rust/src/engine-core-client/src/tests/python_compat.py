@@ -362,8 +362,16 @@ class EngineCoreReadyResponse:
     vllm_version: str
     world_size: int
     data_parallel_size: int
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    data_parallel_rank: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
+    kv_connector: str | None = None
+    kv_role: str | None = None
+    kv_engine_id: str | None = None
 
 
 ready_response = EngineCoreReadyResponse(
@@ -375,6 +383,14 @@ ready_response = EngineCoreReadyResponse(
     vllm_version="0.0.0",
     data_parallel_size=1,
     world_size=1,
+    tensor_parallel_size=2,
+    pipeline_parallel_size=1,
+    data_parallel_rank=0,
+    max_num_seqs=64,
+    max_num_batched_tokens=4096,
+    kv_connector="NixlConnector",
+    kv_role="kv_both",
+    kv_engine_id="engine-0",
 )
 
 print(msgspec.msgpack.encode(request).hex())

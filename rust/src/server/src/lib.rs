@@ -237,8 +237,9 @@ where
             .map(tls::build_grpc_server_config)
             .transpose()
             .context("invalid engine RPC TLS configuration")?;
-        let engine_rpc =
-            grpc::engine_rpc::EngineServer::new(grpc::engine_rpc::EngineServiceImpl::new());
+        let engine_rpc = grpc::engine_rpc::EngineServer::new(
+            grpc::engine_rpc::EngineServiceImpl::new(state.clone()),
+        );
         let svc = TonicServer::builder()
             .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
