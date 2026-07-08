@@ -1,8 +1,3 @@
-// Private RPC API for out-of-process vLLM frontends.
-//
-// This schema is owned by vLLM. Clients must vendor the schema from the vLLM
-// revision they target.
-
 syntax = "proto3";
 
 package vllm.engine.v1;
@@ -27,7 +22,7 @@ service Engine {
   rpc UnloadLora(UnloadLoraRequest) returns (UnloadLoraResponse);
   rpc ListLoras(ListLorasRequest) returns (ListLorasResponse);
 
-  // Disaggregated serving / KV transfer.
+  // Disaggregated serving and KV transfer.
   rpc GetKvConnectorInfo(GetKvConnectorInfoRequest) returns (KvConnectorInfo);
   rpc GetKvEventSources(GetKvEventSourcesRequest) returns (GetKvEventSourcesResponse);
 }
@@ -46,9 +41,9 @@ enum EngineRole {
 message GetEngineInfoRequest {}
 
 message EngineInfo {
-  string engine_name = 1;          // sglang, vllm, tensorrt_llm, etc.
+  string engine_name = 1; // Runtime engine identifier.
   string engine_version = 2;
-  string api_version = 3;          // vllm.engine.v1
+  string api_version = 3; // vllm.engine.v1
   EngineRole role = 4;
   string instance_id = 5;
   repeated string supported_models = 6;
@@ -88,11 +83,7 @@ message ModelInfo {
   bool supports_lora = 22;
   bool supports_multimodal = 23;
 
-  // Engine-advertised response parser names. The orchestrator's frontend applies
-  // these to a sidecar-served model's output stream (tool-call extraction,
-  // reasoning/thinking separation) — the engine streams tokens, the frontend
-  // parses. Empty = no parser configured for this model. Discovered from the
-  // engine so the sidecar stays endpoint-only (no parser flags on the worker).
+  // Configured response parser names. Empty means disabled.
   string reasoning_parser = 24;
   string tool_call_parser = 25;
 }
@@ -147,34 +138,23 @@ message GenerateRequest {
   repeated StopCondition stop = 6;
   bool stream = 7;
 
-  // Multimodal inputs. Requires token_ids input. Order is significant: the
-  // i-th item aligns with the i-th unexpanded placeholder marker in token_ids.
-  // The engine fetches/decodes and preprocesses each item, then expands the
-  // marker into the model's replacement run. Empty for text-only requests.
+  // Requires token_ids; order matches placeholder markers.
   repeated MediaItem media = 8;
 
-  // Loaded LoRA adapter name to apply to this request. Empty = base model.
-  // ModelInfo.supports_lora advertises whether LoRA lifecycle and selection
-  // are available.
+  // Loaded LoRA name; empty selects the base model.
   string lora_name = 9;
 
-  // Required for decode requests in disaggregated serving.
+  // Required for disaggregated decode requests.
   KvSessionRef kv_session = 20;
 
-  // Router-forced internal data-parallel rank. When set, the engine must place
-  // this request on exactly this DP rank instead of load-balancing across
-  // ranks. This is what keeps prefix->rank affinity for KV-aware routing: the
-  // KV router decides a rank from the prefix it indexed, and the engine honors
-  // it so a child block's parent stays in the same rank's radix subtree.
-  // Unset = let the engine pick (no affinity). Rank 0 is valid, hence optional.
+  // Router-selected data-parallel rank.
   optional uint32 data_parallel_rank = 21;
 
-  // Backend scheduling priority. Zero is the engine default.
+  // Backend scheduling priority; zero uses the default.
   optional int32 priority = 22;
 }
 
-// Multimodal modality discriminator. 0 is treated as image for forward
-// compatibility with senders that omit the field.
+// Unspecified defaults to image.
 enum Modality {
   MODALITY_UNSPECIFIED = 0;
   MODALITY_IMAGE = 1;
@@ -182,19 +162,16 @@ enum Modality {
   MODALITY_AUDIO = 3;
 }
 
-// A single multimodal input. Exactly one `source` should be set. The engine
-// owns fetch/decode/preprocess -- the orchestrator never derefs media (it has
-// no GPU/NIXL agent in the sidecar deployment), so a pre-decoded/RDMA media
-// descriptor is NOT representable here by design.
+// The engine fetches, decodes, and preprocesses one source.
 message MediaItem {
   Modality modality = 1;
   oneof source {
-    string url       = 2;   // http(s):// -- engine fetches
-    string data_uri  = 3;   // data:<mime>;base64,<...> -- engine decodes
-    bytes  raw_bytes = 4;   // pre-fetched bytes -- engine still preprocesses
+    string url = 2; // Engine-fetched URL.
+    string data_uri = 3; // Engine-decoded data URI.
+    bytes raw_bytes = 4; // Pre-fetched bytes.
   }
-  string mime_type = 5;     // optional, hints raw_bytes decode
-  string uuid      = 6;     // optional caller id / mm_hash
+  string mime_type = 5; // Optional decoding hint.
+  string uuid = 6; // Optional caller identifier.
 }
 
 message TokenIds {
@@ -209,9 +186,7 @@ message SamplingParams {
   optional double presence_penalty = 5;
   optional uint32 max_tokens = 6;
   optional int64 seed = 7;
-  // When true the engine ignores the EOS token and generates until another
-  // stop condition (e.g. max_tokens) fires. Without it the engine stops at
-  // natural EOS, which truncates fixed-length benchmark workloads.
+  // Ignore EOS and continue until another stop condition.
   bool ignore_eos = 8;
   optional double min_p = 9;
   optional double repetition_penalty = 10;
@@ -274,18 +249,14 @@ message KvSessionRef {
   string session_id = 1;
   string transfer_backend = 2;
   uint32 dp_rank = 3;
-  // Engine-specific KV-transfer parameters (e.g. NixlConnector
-  // remote_host / remote_port / tp_size / remote_block_ids / do_remote_*),
-  // carried as a Struct so numbers, booleans, and arrays survive the wire with
-  // their JSON type intact. Struct numbers are IEEE-754 doubles (exact only to
-  // 2^53); carry larger integer values as strings or use a dedicated field.
+  // Engine-specific KV-transfer metadata.
   google.protobuf.Struct attributes_struct = 4;
 }
 
 message KvEndpoint {
   string host = 1;
   uint32 port = 2;
-  string protocol = 3; // grpc, nixl, ucx, tcp, shm, etc.
+  string protocol = 3; // grpc, nixl, ucx, tcp, or shm.
 }
 
 // ---------------------------------------------------------------------------
@@ -309,13 +280,13 @@ message GetKvEventSourcesResponse {
 }
 
 message KvEventSource {
-  string transport = 1;          // grpc, zmq
-  // Connectable address. MUST use a routable host, never a bind wildcard.
+  string transport = 1; // grpc or zmq.
+  // Connectable address, not a bind wildcard.
   KvEndpoint endpoint_addr = 2;
   string topic = 3;
-  string replay_endpoint = 4;    // optional, for ZMQ replay
+  string replay_endpoint = 4; // Optional ZMQ replay endpoint.
   uint32 data_parallel_rank = 5;
-  string encoding = 6;           // protobuf, msgpack
+  string encoding = 6; // protobuf or msgpack.
   uint32 schema_version = 7;
   uint32 buffer_steps = 8;
   uint32 hwm = 9;
@@ -327,14 +298,10 @@ message KvEventSource {
 // ---------------------------------------------------------------------------
 
 message HealthRequest {
-  // False means a lightweight readiness/liveness check. True asks the engine to
-  // run a role-appropriate minimal inference probe and report it as a check.
+  // Run a minimal inference probe when true.
   bool include_inference_probe = 1;
-
-  // Optional. Used when include_inference_probe is true. Empty means engine
-  // default served model.
+  // Empty selects the default served model.
   string model = 2;
-
 }
 
 message HealthResponse {
@@ -352,7 +319,7 @@ enum HealthState {
 }
 
 message HealthCheck {
-  string name = 1; // grpc, scheduler, model, kv_connector, role, inference_probe
+  string name = 1; // grpc, scheduler, model, connector, role, or inference.
   HealthState state = 2;
   string message = 3;
 }
