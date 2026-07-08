@@ -1,5 +1,3 @@
-//! Private RPC service for out-of-process vLLM frontends.
-
 use std::pin::Pin;
 
 use futures::Stream;
