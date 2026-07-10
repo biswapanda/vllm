@@ -10,6 +10,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 format!("{proto_dir}/vllm_grpc.proto"),
                 format!("{proto_dir}/engine.proto"),
+                format!("{proto_dir}/openengine.proto"),
+                format!("{proto_dir}/prime_rl.proto"),
             ],
             &[proto_dir],
         )?;
