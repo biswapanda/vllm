@@ -38,6 +38,8 @@ mod generate;
 mod lifecycle;
 mod lora;
 mod media;
+mod openengine;
+mod prime_rl;
 mod topology;
 
 // ========================================================================================

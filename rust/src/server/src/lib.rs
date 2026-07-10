@@ -237,15 +237,22 @@ where
             .map(tls::build_grpc_server_config)
             .transpose()
             .context("invalid engine RPC TLS configuration")?;
-        let engine_rpc = grpc::engine_rpc::EngineServer::new(
-            grpc::engine_rpc::EngineServiceImpl::new(state.clone()),
-        );
+        let engine_rpc_impl = Arc::new(grpc::engine_rpc::EngineServiceImpl::new(state.clone()));
+        let engine_rpc = grpc::engine_rpc::EngineServer::from_arc(engine_rpc_impl.clone());
+        let openengine = grpc::engine_rpc::OpenEngineServer::from_arc(engine_rpc_impl.clone());
+        let prime_rl = grpc::engine_rpc::PrimeRlEngineServer::from_arc(engine_rpc_impl);
         let svc = TonicServer::builder()
             .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
             .layer(middleware::request_runtime_layer(state.clone()))
-            .add_service(engine_rpc);
-        info!(%addr, tls = engine_rpc_tls.is_some(), "starting engine RPC server");
+            .add_service(engine_rpc)
+            .add_service(openengine)
+            .add_service(prime_rl);
+        info!(
+            %addr,
+            tls = engine_rpc_tls.is_some(),
+            "starting private Engine, canonical OpenEngine, and Prime RL gRPC services"
+        );
         Some((engine_rpc_listener, svc, engine_rpc_tls))
     } else {
         None

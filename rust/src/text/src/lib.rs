@@ -75,6 +75,12 @@ impl TextLlm {
         self
     }
 
+    /// Return the effective maximum top-logprob count accepted by this facade.
+    /// `-1` means the tokenizer vocabulary is the only limit.
+    pub fn max_logprobs(&self) -> i32 {
+        self.max_logprobs
+    }
+
     /// Return the backend model ID.
     pub fn model_id(&self) -> &str {
         self.backend.model_id()

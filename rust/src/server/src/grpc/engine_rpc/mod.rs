@@ -1,5 +1,7 @@
 mod convert;
 mod lora;
+mod openengine;
+mod prime_rl;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,12 +23,14 @@ pub mod pb {
     tonic::include_proto!("vllm.engine.v1");
 }
 
+pub use openengine::OpenEngineServer;
 pub use pb::engine_server::EngineServer;
+pub use prime_rl::PrimeRlEngineServer;
 
 const ENGINE_RPC_API_VERSION: &str = "vllm.engine.v1";
 const INFERENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+pub(super) type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 #[derive(Default)]
 struct AdmissionState {
@@ -37,6 +41,8 @@ struct AdmissionState {
 pub struct EngineServiceImpl {
     state: Arc<AppState>,
     admission: Arc<AdmissionState>,
+    rl_admin: Arc<tokio::sync::Mutex<prime_rl::RlAdminState>>,
+    rl_indeterminate: AtomicBool,
 }
 
 impl EngineServiceImpl {
@@ -44,6 +50,8 @@ impl EngineServiceImpl {
         Self {
             state,
             admission: Arc::new(AdmissionState::default()),
+            rl_admin: Arc::new(tokio::sync::Mutex::new(prime_rl::RlAdminState::default())),
+            rl_indeterminate: AtomicBool::new(false),
         }
     }
 
@@ -89,6 +97,15 @@ impl EngineServiceImpl {
         self.admission.in_flight.load(Ordering::SeqCst)
     }
 
+    fn mark_rl_indeterminate(&self) {
+        self.rl_indeterminate.store(true, Ordering::SeqCst);
+        self.begin_drain();
+    }
+
+    fn is_rl_indeterminate(&self) -> bool {
+        self.rl_indeterminate.load(Ordering::SeqCst)
+    }
+
     fn try_admit(&self) -> Option<AdmissionGuard> {
         if self.is_draining() {
             return None;
@@ -100,40 +117,19 @@ impl EngineServiceImpl {
         }
         Some(AdmissionGuard(self.admission.clone()))
     }
-}
 
-fn per_rank_kv_blocks(ready: &[&EngineCoreReadyResponse]) -> u64 {
-    ready.iter().map(|response| response.num_gpu_blocks).min().unwrap_or(0)
-}
-
-struct AdmissionGuard(Arc<AdmissionState>);
-
-impl Drop for AdmissionGuard {
-    fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-fn health_check(name: &str, state: pb::HealthState, message: Option<String>) -> pb::HealthCheck {
-    pb::HealthCheck {
-        name: name.to_string(),
-        state: state as i32,
-        message: message.unwrap_or_default(),
-    }
-}
-
-#[tonic::async_trait]
-impl pb::engine_server::Engine for EngineServiceImpl {
-    type GenerateStream = ResponseStream<pb::GenerateResponse>;
-
-    async fn generate(
+    async fn prepare_generate(
         &self,
-        request: Request<pb::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+        proto_request: pb::GenerateRequest,
+    ) -> Result<PreparedGenerate, Status> {
         let guard =
             self.try_admit().ok_or_else(|| Status::unavailable("engine RPC is draining"))?;
+        if self.is_rl_indeterminate() {
+            return Err(Status::failed_precondition(
+                "engine weight state is indeterminate and requires restart",
+            ));
+        }
 
-        let proto_request = request.into_inner();
         let lora_name = proto_request.lora_name.clone();
         let role = convert::role_from_kv_role(self.ready().kv_role.as_deref());
         let handoff_dp_rank = convert::validate_disaggregated_request(
@@ -183,11 +179,72 @@ impl pb::engine_server::Engine for EngineServiceImpl {
         }
 
         let request_id = text_request.request_id.clone();
-        info!(%request_id, "engine_rpc generate");
         let kv_connector = self.ready().kv_connector.clone();
         if role == pb::EngineRole::Prefill {
             convert::mark_prefill_request(&mut text_request);
         }
+
+        Ok(PreparedGenerate {
+            guard,
+            text_request,
+            request_id,
+            role,
+            kv_connector,
+            handoff_dp_rank,
+            lora_lease,
+        })
+    }
+}
+
+fn per_rank_kv_blocks(ready: &[&EngineCoreReadyResponse]) -> u64 {
+    ready.iter().map(|response| response.num_gpu_blocks).min().unwrap_or(0)
+}
+
+struct AdmissionGuard(Arc<AdmissionState>);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(super) struct PreparedGenerate {
+    guard: AdmissionGuard,
+    pub(super) text_request: TextRequest,
+    pub(super) request_id: String,
+    pub(super) role: pb::EngineRole,
+    pub(super) kv_connector: Option<String>,
+    pub(super) handoff_dp_rank: u32,
+    pub(super) lora_lease: crate::lora::LoraLease,
+}
+
+fn health_check(name: &str, state: pb::HealthState, message: Option<String>) -> pb::HealthCheck {
+    pb::HealthCheck {
+        name: name.to_string(),
+        state: state as i32,
+        message: message.unwrap_or_default(),
+    }
+}
+
+#[tonic::async_trait]
+impl pb::engine_server::Engine for EngineServiceImpl {
+    type GenerateStream = ResponseStream<pb::GenerateResponse>;
+
+    async fn generate(
+        &self,
+        request: Request<pb::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        let prepared = self.prepare_generate(request.into_inner()).await?;
+        let PreparedGenerate {
+            guard,
+            text_request,
+            request_id,
+            role,
+            kv_connector,
+            handoff_dp_rank,
+            lora_lease,
+        } = prepared;
+        info!(%request_id, "engine_rpc generate");
         let stream = self
             .state
             .chat
