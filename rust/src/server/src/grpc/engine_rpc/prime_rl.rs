@@ -23,6 +23,7 @@ const MAX_GROUP_TIMEOUT_SECS: u64 = 86_400;
 const PAUSE_CONSENSUS_TIMEOUT: Duration = Duration::from_secs(10);
 const WEIGHT_OPERATION_TIMEOUT: Duration = Duration::from_secs(640);
 const CACHE_RESET_TIMEOUT: Duration = Duration::from_secs(60);
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) struct RlAdminState {
     paused: bool,
@@ -78,6 +79,17 @@ impl pb::prime_rl_engine_server::PrimeRlEngine for EngineServiceImpl {
                     .unwrap_or_else(|| "engine is not healthy".to_string()),
             ));
         }
+        bounded_engine_call(
+            "liveness_probe",
+            LIVENESS_PROBE_TIMEOUT,
+            self.state.engine_core_client().collective_rpc(
+                "liveness_probe",
+                None,
+                Vec::<Value>::new(),
+                BTreeMap::<String, Value>::new(),
+            ),
+        )
+        .await?;
         Ok(Response::new(admin_ok("alive")))
     }
 

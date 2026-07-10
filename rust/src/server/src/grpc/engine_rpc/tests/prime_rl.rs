@@ -35,6 +35,19 @@ async fn prime_rl_test_server() -> (
         vec![0x00, 0x00],
         move |dealer, push| {
             boxed_test_future(async move {
+                let liveness = recv_engine_message(dealer).await;
+                let liveness: rmpv::Value = rmp_serde::from_slice(&liveness[1]).unwrap();
+                let liveness = liveness.as_array().unwrap();
+                assert_eq!(liveness[2], rmpv::Value::from("collective_rpc"));
+                let args = liveness[3].as_array().unwrap();
+                assert_eq!(args[0], rmpv::Value::from("liveness_probe"));
+                send_utility_value(
+                    push,
+                    liveness[1].as_u64().unwrap(),
+                    rmpv::Value::Array(Vec::new()),
+                )
+                .await;
+
                 let pause = recv_engine_message(dealer).await;
                 let pause: rmpv::Value = rmp_serde::from_slice(&pause[1]).unwrap();
                 let pause = pause.as_array().unwrap();
@@ -122,6 +135,9 @@ async fn prime_rl_test_server() -> (
 #[tokio::test]
 async fn prime_rl_pause_update_version_and_resume_are_serialized() {
     let (mut client, server_task, engine_task, _service) = prime_rl_test_server().await;
+
+    let liveness = client.liveness_probe(pb::LivenessProbeRequest {}).await.unwrap().into_inner();
+    assert_eq!(liveness.status, "ok");
 
     client
         .pause_generation(pb::PauseGenerationRequest {
