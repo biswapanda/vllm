@@ -69,7 +69,7 @@ async fn canonical_openengine_discovers_and_generates() {
     let (mut client, server_task, engine_task) = openengine_test_server().await;
 
     let engine = client.get_engine_info(pb::GetEngineInfoRequest {}).await.unwrap().into_inner();
-    assert_eq!(engine.schema_revision, 1);
+    assert_eq!(engine.schema_revision, 2);
     assert_eq!(engine.minimum_client_revision, 1);
     assert!(!engine.schema_release.is_empty());
     assert_eq!(engine.supported_models, vec!["test-model"]);

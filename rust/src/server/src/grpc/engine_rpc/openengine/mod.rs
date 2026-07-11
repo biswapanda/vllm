@@ -18,8 +18,9 @@ pub mod pb {
 
 pub use pb::open_engine_server::OpenEngineServer;
 
-const SCHEMA_REVISION: u32 = 1;
-const SCHEMA_RELEASE: &str = "openengine@7093bf087fcca367bd2b9b4fc233fb434d3c1c31";
+const SCHEMA_REVISION: u32 = 2;
+const MINIMUM_CLIENT_REVISION: u32 = 1;
+const SCHEMA_RELEASE: &str = "openengine@v2-skip-special-tokens";
 
 #[tonic::async_trait]
 impl pb::open_engine_server::OpenEngine for EngineServiceImpl {
@@ -104,7 +105,7 @@ impl pb::open_engine_server::OpenEngine for EngineServiceImpl {
             }),
             kv_connector: Some(canonical_kv_connector(self.kv_connector_info())),
             schema_revision: SCHEMA_REVISION,
-            minimum_client_revision: SCHEMA_REVISION,
+            minimum_client_revision: MINIMUM_CLIENT_REVISION,
             schema_release: SCHEMA_RELEASE.to_string(),
         }))
     }

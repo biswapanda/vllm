@@ -21,6 +21,7 @@ pub(super) struct RequestExtensions {
     pub(super) include_stop_in_output: bool,
     pub(super) cache_salt: Option<String>,
     pub(super) bypass_prefix_cache: Option<bool>,
+    pub(super) skip_special_tokens: Option<bool>,
 }
 
 type LogprobOptions = (Option<i32>, Option<i32>, Option<Vec<u32>>);
@@ -136,6 +137,7 @@ pub(super) fn to_private_request(
         });
 
     let (logprobs, prompt_logprobs, logprob_token_ids) = response_options(response.as_ref())?;
+    let skip_special_tokens = response.as_ref().and_then(|options| options.skip_special_tokens);
     let structured_outputs = guided.map(guided_to_structured_output).transpose()?;
     let extensions = RequestExtensions {
         logprobs,
@@ -145,6 +147,7 @@ pub(super) fn to_private_request(
         include_stop_in_output: stopping.include_stop_in_output.unwrap_or(false),
         cache_salt,
         bypass_prefix_cache,
+        skip_special_tokens,
     };
 
     Ok((
@@ -176,6 +179,9 @@ pub(super) fn apply_extensions(request: &mut TextRequest, extensions: RequestExt
     request.sampling_params.structured_outputs = extensions.structured_outputs;
     request.sampling_params.skip_reading_prefix_cache = extensions.bypass_prefix_cache;
     request.decode_options.include_stop_str_in_output = extensions.include_stop_in_output;
+    if let Some(skip_special_tokens) = extensions.skip_special_tokens {
+        request.decode_options.skip_special_tokens = skip_special_tokens;
+    }
     request.cache_salt = extensions.cache_salt;
 }
 
@@ -568,6 +574,7 @@ mod tests {
                     selection: Some(pb::candidate_token_selection::Selection::TopN(2)),
                 }),
                 prompt_logprob_start: Some(0),
+                skip_special_tokens: Some(false),
             }),
             kv: Some(pb::KvOptions {
                 session: None,
@@ -602,6 +609,7 @@ mod tests {
         );
         assert!(text_request.sampling_params.structured_outputs.is_some());
         assert!(text_request.decode_options.include_stop_str_in_output);
+        assert!(!text_request.decode_options.skip_special_tokens);
         assert_eq!(text_request.cache_salt.as_deref(), Some("tenant-a"));
     }
 
