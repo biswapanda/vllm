@@ -5183,6 +5183,93 @@ async fn collective_rpc_route_sends_expected_utility_call_and_returns_results() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn update_weights_route_matches_prime_filesystem_worker_contract() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            assert_eq!(utility[0].as_ref(), &[0x03]);
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("collective_rpc"));
+            assert_eq!(
+                array[3],
+                Value::Array(vec![
+                    Value::from("update_weights_from_path"),
+                    Value::Nil,
+                    Value::Array(vec![Value::from("outputs/checkpoints/step-7")]),
+                    Value::Map(Vec::new()),
+                ])
+            );
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/update_weights")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"weight_dir":"outputs/checkpoints/step-7"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({"status": "ok"})
+    );
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn update_weights_route_forwards_null_for_nccl_worker_contract() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("collective_rpc"));
+            assert_eq!(
+                array[3],
+                Value::Array(vec![
+                    Value::from("update_weights_from_path"),
+                    Value::Nil,
+                    Value::Array(vec![Value::Nil]),
+                    Value::Map(Vec::new()),
+                ])
+            );
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/update_weights")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"weight_dir":null}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn sleep_route_uses_python_compatible_default_query_values() {
     let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
         boxed_test_future(async move {
@@ -5584,6 +5671,7 @@ async fn admin_routes_are_hidden_when_dev_mode_is_disabled() {
         ("POST", "/pause"),
         ("POST", "/resume"),
         ("POST", "/collective_rpc"),
+        ("POST", "/update_weights"),
         ("POST", "/abort_requests"),
         ("POST", "/reset_prefix_cache"),
         ("POST", "/reset_mm_cache"),

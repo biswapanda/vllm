@@ -21,6 +21,7 @@ const EXCLUDED_HANDLERS: &[&str] = &[
     "/reset_mm_cache",
     "/reset_encoder_cache",
     "/collective_rpc",
+    "/update_weights",
     "/sleep",
     "/wake_up",
     "/is_sleeping",
