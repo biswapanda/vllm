@@ -244,7 +244,8 @@ impl LoraManager {
         &self,
         engine_core_client: &EngineCoreClient,
         base_model_names: &[String],
-        lora_request: LoraRequest,
+        mut lora_request: LoraRequest,
+        load_inplace: bool,
     ) -> Result<(LoraRequest, bool), LoadExactLoraError> {
         let _guard = self.update_lock.lock().await;
         if !self.is_consistent() {
@@ -257,38 +258,62 @@ impl LoraManager {
         }
 
         let registry = self.registry.read().await;
+        let same_name = registry.get(&lora_request.lora_name);
         if let Some(existing) = registry.values().find(|loaded| {
-            let existing = &loaded.request;
-            existing.lora_name == lora_request.lora_name
-                || existing.lora_int_id == lora_request.lora_int_id
-                || existing.lora_path == lora_request.lora_path
+            loaded.request.lora_name != lora_request.lora_name
+                && (loaded.request.lora_int_id == lora_request.lora_int_id
+                    || loaded.request.lora_path == lora_request.lora_path)
         }) {
-            let existing = &existing.request;
-            if same_wire_identity(existing, &lora_request) {
-                return Ok((existing.clone(), true));
-            }
             return Err(LoadExactLoraError::Conflict {
-                existing: existing.clone(),
+                existing: existing.request.clone(),
             });
         }
+        let previous = if let Some(existing) = same_name {
+            if same_wire_identity(&existing.request, &lora_request) {
+                return Ok((existing.request.clone(), true));
+            }
+            if !load_inplace
+                || existing.request.lora_name != lora_request.lora_name
+                || existing.request.lora_int_id != lora_request.lora_int_id
+            {
+                return Err(LoadExactLoraError::Conflict {
+                    existing: existing.request.clone(),
+                });
+            }
+            Some((existing.request.clone(), existing.lease.clone()))
+        } else {
+            None
+        };
         drop(registry);
 
-        let mut mutation =
-            self.apply_load(engine_core_client, &lora_request, None)
-                .await
-                .map_err(|error| match error {
-                    ApplyLoadError::Engine(error) => LoadExactLoraError::Engine(error),
-                    ApplyLoadError::Rejected => LoadExactLoraError::NotLoaded {
-                        lora_name: lora_request.lora_name.clone(),
-                    },
-                })?;
+        let _generation_guard = match previous.as_ref().map(|(_, lease)| lease.clone()) {
+            Some(lease) => Some(lease.write_owned().await),
+            None => None,
+        };
+        lora_request.load_inplace = load_inplace;
+
+        let mut mutation = self
+            .apply_load(
+                engine_core_client,
+                &lora_request,
+                previous.as_ref().map(|(request, _)| request),
+            )
+            .await
+            .map_err(|error| match error {
+                ApplyLoadError::Engine(error) => LoadExactLoraError::Engine(error),
+                ApplyLoadError::Rejected => LoadExactLoraError::NotLoaded {
+                    lora_name: lora_request.lora_name.clone(),
+                },
+            })?;
 
         self.id_counter.fetch_max(lora_request.lora_int_id, Ordering::Relaxed);
         self.registry.write().await.insert(
             lora_request.lora_name.clone(),
             LoadedLora {
                 request: lora_request.clone(),
-                lease: std::sync::Arc::new(RwLock::new(())),
+                lease: previous
+                    .map(|(_, lease)| lease)
+                    .unwrap_or_else(|| std::sync::Arc::new(RwLock::new(()))),
             },
         );
         mutation.prove_final_state();
@@ -695,6 +720,65 @@ mod tests {
         let _ = shutdown_one.send(());
         task_zero.await.unwrap();
         task_one.await.unwrap();
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_load_inplace_replaces_path_while_preserving_name_and_id() {
+        let ipc = IpcNamespace::new().unwrap();
+        let handshake = ipc.handshake_endpoint();
+        let (shutdown, task) = spawn_mock_engine_task_with_ready(
+            handshake.clone(),
+            vec![0x00, 0x00],
+            vllm_engine_core_client::mock_engine::default_ready_response(),
+            |dealer, push| {
+                Box::pin(async move {
+                    for _ in 0..2 {
+                        let load = recv_utility_call_id(dealer, "add_lora").await;
+                        reply_utility(push, load, true).await;
+                    }
+                })
+            },
+        );
+        let config = EngineCoreClientConfig::new_single(handshake)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            );
+        let client = EngineCoreClient::connect(config).await.unwrap();
+        let manager = LoraManager::new();
+        let first = LoraRequest::new(
+            "adapter-a".to_string(),
+            17,
+            "/adapters/step-1".to_string(),
+            false,
+            false,
+        );
+        manager
+            .load_lora_exact(&client, &["test-model".to_string()], first, false)
+            .await
+            .unwrap();
+        let second = LoraRequest::new(
+            "adapter-a".to_string(),
+            17,
+            "/adapters/step-2".to_string(),
+            false,
+            false,
+        );
+        manager
+            .load_lora_exact(&client, &["test-model".to_string()], second, true)
+            .await
+            .unwrap();
+
+        let loaded = manager.served_lora_requests().await;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].lora_name, "adapter-a");
+        assert_eq!(loaded[0].lora_int_id, 17);
+        assert_eq!(loaded[0].lora_path, "/adapters/step-2");
+
+        let _ = shutdown.send(());
+        task.await.unwrap();
         client.shutdown().await.unwrap();
     }
 }

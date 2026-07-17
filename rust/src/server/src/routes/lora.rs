@@ -35,7 +35,7 @@ pub(crate) struct UnloadLoraAdapterRequest {
 
 impl Normalizable for UnloadLoraAdapterRequest {}
 
-fn runtime_lora_allowed_path_prefixes() -> Option<Vec<PathBuf>> {
+pub(crate) fn runtime_lora_allowed_path_prefixes() -> Option<Vec<PathBuf>> {
     let prefixes = std::env::var_os(RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV)?;
     let prefixes: Vec<_> = std::env::split_paths(&prefixes)
         .filter(|path| !path.as_os_str().is_empty())
@@ -51,7 +51,7 @@ fn looks_like_local_lora_path(lora_path: &str) -> bool {
         || path.components().any(|component| matches!(component, Component::ParentDir))
 }
 
-fn validate_lora_path_access(
+pub(crate) fn validate_lora_path_access(
     lora_path: &str,
     allowed_prefixes: Option<&[PathBuf]>,
 ) -> Result<Option<String>, ApiError> {

@@ -194,12 +194,14 @@ impl AppState {
     pub async fn load_lora_exact(
         &self,
         lora_request: LoraRequest,
+        load_inplace: bool,
     ) -> Result<(LoraRequest, bool), LoadExactLoraError> {
         self.lora_manager
             .load_lora_exact(
                 self.engine_core_client(),
                 &self.served_model_names,
                 lora_request,
+                load_inplace,
             )
             .await
     }

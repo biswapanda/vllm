@@ -6,6 +6,7 @@ use vllm_engine_core_client::protocol::lora::LoraRequest;
 
 use super::pb;
 use crate::lora::{LoadExactLoraError, UnloadLoraError};
+use crate::routes::{runtime_lora_allowed_path_prefixes, validate_lora_path_access};
 use crate::state::AppState;
 
 fn ensure_enabled(state: &AppState) -> Result<(), Status> {
@@ -29,27 +30,29 @@ pub(super) async fn load_lora(
 ) -> Result<Response<pb::LoadLoraResponse>, Status> {
     ensure_enabled(state)?;
     ensure_consistent(state)?;
+    let request = request.into_inner();
+    let load_inplace = request.load_inplace;
     let adapter = normalize_adapter(
-        request
-            .into_inner()
-            .adapter
-            .ok_or_else(|| Status::invalid_argument("adapter is required"))?,
+        request.adapter.ok_or_else(|| Status::invalid_argument("adapter is required"))?,
     )
     .await?;
     let (adapter, already_loaded) =
-        state.load_lora_exact(adapter).await.map_err(|error| match error {
-            LoadExactLoraError::Inconsistent => Status::failed_precondition(
-                "LoRA state differs across engine ranks; restart the engine",
-            ),
-            LoadExactLoraError::BaseModelName { lora_name } => Status::already_exists(format!(
-                "LoRA adapter `{lora_name}` conflicts with a served base model"
-            )),
-            LoadExactLoraError::Conflict { existing } => conflict(&existing),
-            LoadExactLoraError::Engine(error) => Status::internal(error.to_report_string()),
-            LoadExactLoraError::NotLoaded { lora_name } => Status::internal(format!(
-                "one or more engine ranks rejected LoRA adapter `{lora_name}`"
-            )),
-        })?;
+        state
+            .load_lora_exact(adapter, load_inplace)
+            .await
+            .map_err(|error| match error {
+                LoadExactLoraError::Inconsistent => Status::failed_precondition(
+                    "LoRA state differs across engine ranks; restart the engine",
+                ),
+                LoadExactLoraError::BaseModelName { lora_name } => Status::already_exists(format!(
+                    "LoRA adapter `{lora_name}` conflicts with a served base model"
+                )),
+                LoadExactLoraError::Conflict { existing } => conflict(&existing),
+                LoadExactLoraError::Engine(error) => Status::internal(error.to_report_string()),
+                LoadExactLoraError::NotLoaded { lora_name } => Status::internal(format!(
+                    "one or more engine ranks rejected LoRA adapter `{lora_name}`"
+                )),
+            })?;
     Ok(Response::new(pb::LoadLoraResponse {
         adapter: Some(to_proto(&adapter)),
         already_loaded,
@@ -117,9 +120,20 @@ async fn normalize_adapter(adapter: pb::LoraAdapter) -> Result<LoraRequest, Stat
     if !path.is_absolute() {
         return Err(Status::invalid_argument("source_path must be absolute"));
     }
-    let canonical = tokio::fs::canonicalize(path)
-        .await
-        .map_err(|error| Status::invalid_argument(format!("invalid source_path: {error}")))?;
+    let canonical = validate_lora_path_access(
+        &adapter.source_path,
+        runtime_lora_allowed_path_prefixes().as_deref(),
+    )
+    .map_err(|error| {
+        let message = error.to_error_response().error.message;
+        if error.status_code().is_client_error() {
+            Status::invalid_argument(message)
+        } else {
+            Status::internal(message)
+        }
+    })?
+    .ok_or_else(|| Status::invalid_argument("source_path must be a local path"))?;
+    let canonical = Path::new(&canonical);
     let metadata = tokio::fs::metadata(&canonical)
         .await
         .map_err(|error| Status::invalid_argument(format!("invalid source_path: {error}")))?;

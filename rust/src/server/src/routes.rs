@@ -5,6 +5,7 @@ mod health;
 mod inference;
 mod load;
 mod lora;
+pub(crate) use lora::{runtime_lora_allowed_path_prefixes, validate_lora_path_access};
 mod metrics;
 pub(crate) mod openai;
 mod pause;
