@@ -22,12 +22,12 @@ use vllm_chat::{
     ChatBackend, ChatLlm, ChatRenderer, ChatRequest, ChatTextBackend, DefaultChatOutputProcessor,
     DynChatOutputProcessor, DynChatRenderer, NewChatOutputProcessorOptions, RenderedPrompt,
 };
-use vllm_engine_core_client::mock_engine::DEFAULT_MOCK_MAX_MODEL_LEN;
+use vllm_engine_core_client::mock_engine::{DEFAULT_MOCK_MAX_MODEL_LEN, default_ready_response};
 use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
 };
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
-use vllm_engine_core_client::test_utils::{IpcNamespace, spawn_mock_engine_task};
+use vllm_engine_core_client::test_utils::{IpcNamespace, spawn_mock_engine_task_with_ready};
 use vllm_engine_core_client::{
     ENGINE_CORE_DEAD_SENTINEL, EngineCoreClient, EngineCoreClientConfig, EngineId,
 };
@@ -45,6 +45,8 @@ use crate::listener::{Listener, MaybeTlsListener};
 use crate::state::AppState;
 use crate::tls;
 use crate::tls_tests::{TestCerts, server_tls};
+
+mod lora;
 
 // ========================================================================================
 // Helpers (mirrors the patterns in routes/tests.rs)
@@ -235,13 +237,29 @@ async fn setup_grpc_service_with_engine<F>(
 where
     F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
 {
+    setup_grpc_service_with_ready_and_engine(engine_id, default_ready_response(), run).await
+}
+
+async fn setup_grpc_service_with_ready_and_engine<F>(
+    engine_id: impl Into<EngineId>,
+    ready_response: vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse,
+    run: F,
+) -> (
+    GenerateServiceImpl,
+    tokio::sync::watch::Receiver<bool>,
+    MockEngineTask,
+)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let engine_id = engine_id.into();
 
-    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_ready(
         handshake_address.clone(),
         engine_id.clone(),
+        ready_response,
         run,
     ));
 
@@ -1123,7 +1141,9 @@ async fn discovery_and_lifecycle_methods_share_listener() {
     let server = client.get_server_info(pb::GetServerInfoRequest {}).await.unwrap().into_inner();
     assert_eq!(server.api_version, "vllm");
     assert_eq!(server.max_model_len, DEFAULT_MOCK_MAX_MODEL_LEN as u32);
-    assert_eq!(server.parallelism.unwrap().tensor_parallel_size, 1);
+    let parallelism = server.parallelism.expect("parallelism should be reported");
+    assert_eq!(parallelism.tensor_parallel_size, 1);
+    assert_eq!(parallelism.managed_data_parallel_size, 1);
 
     let model = client.get_model_info(pb::GetModelInfoRequest {}).await.unwrap().into_inner();
     assert_eq!(model.model_id, "test-model");

@@ -87,3 +87,18 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+### Runtime LoRA adapters
+
+Dynamic LoRA loading requires `VLLM_ALLOW_RUNTIME_LORA_UPDATING=1`. When an adapter is loaded from
+the local filesystem, `VLLM_RUNTIME_LORA_ALLOWED_PATH_PREFIXES` is also required. Set it to a
+platform-separated list of directories that may contain adapters; local paths outside those
+directories are rejected. Hugging Face repository IDs do not require a local path prefix.
+
+For example:
+
+```bash
+VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 \
+VLLM_RUNTIME_LORA_ALLOWED_PATH_PREFIXES=/model-cache/loras:/workspace/loras \
+vllm serve Qwen/Qwen3-0.6B --enable-lora
+```

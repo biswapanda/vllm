@@ -32,8 +32,9 @@ use crate::protocol::stats::SchedulerStats;
 use crate::protocol::tensor::WireTensor;
 use crate::protocol::utility::{UtilityOutput, UtilityResultEnvelope};
 use crate::test_utils::{
-    IpcNamespace, setup_bootstrapped_mock_engine, setup_mock_engine_sockets,
-    setup_mock_engine_with_init, spawn_mock_engine_task, spawn_mock_engine_task_with_ready,
+    IpcNamespace, setup_bootstrapped_mock_engine, setup_bootstrapped_mock_engine_with_ready,
+    setup_mock_engine_sockets, setup_mock_engine_sockets_with_ready, spawn_mock_engine_task,
+    spawn_mock_engine_task_with_ready,
 };
 use crate::{
     CoordinatorMode, ENGINE_CORE_DEAD_SENTINEL, EngineCoreClient, EngineCoreClientConfig, EngineId,
@@ -338,6 +339,32 @@ fn two_rank_ready(rank: u32) -> EngineCoreReadyResponse {
     }
 }
 
+async fn setup_two_rank_mock_engine_sockets(
+    engine_handshake: String,
+    engine_id: impl Into<EngineId>,
+    rank: u32,
+) -> crate::mock_engine::MockEngineSockets {
+    setup_mock_engine_sockets_with_ready(engine_handshake, engine_id, two_rank_ready(rank)).await
+}
+
+fn spawn_two_rank_mock_engine_task<F>(
+    engine_handshake: String,
+    engine_id: impl Into<EngineId>,
+    rank: u32,
+    run: F,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>)
+where
+    F: for<'a> FnOnce(
+            &'a mut DealerSocket,
+            &'a mut PushSocket,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+        + Send
+        + 'static,
+{
+    spawn_mock_engine_task_with_ready(engine_handshake, engine_id, two_rank_ready(rank), run)
+}
+
 fn bootstrapped_test_config_with_start_index(
     input_address: String,
     output_address: String,
@@ -394,6 +421,7 @@ async fn send_external_coordinator_publish<T: serde::Serialize>(
 fn spawn_mock_engine_task_with_init<F>(
     engine_handshake: String,
     engine_id: impl Into<EngineId>,
+    rank: u32,
     run: F,
 ) -> (
     oneshot::Receiver<HandshakeInitMessage>,
@@ -413,10 +441,11 @@ where
     let (init_tx, init_rx) = oneshot::channel();
     let engine_id = engine_id.into();
     let engine_task = tokio::spawn(async move {
-        let (init, mut dealer, mut push) =
-            setup_mock_engine_with_init(engine_handshake, engine_id).await;
-        let _ = init_tx.send(init);
-        run(&mut dealer, &mut push).await;
+        let mut sockets =
+            setup_two_rank_mock_engine_sockets(engine_handshake, engine_id, rank).await;
+        let _ = init_tx.send(sockets.init);
+        let data_socket = sockets.data_sockets.first_mut().expect("mock engine data socket");
+        run(&mut data_socket.dealer, &mut data_socket.push).await;
         let _ = shutdown_rx.await;
     });
     (init_rx, shutdown_tx, engine_task)
@@ -569,7 +598,8 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
     let engine0_task = tokio::spawn({
         let handshake_address = handshake_address.clone();
         async move {
-            let mut engine = setup_mock_engine_sockets(handshake_address, &[0x00, 0x00]).await;
+            let mut engine =
+                setup_two_rank_mock_engine_sockets(handshake_address, &[0x00, 0x00], 0).await;
             let mut coordinator =
                 engine.coordinator.take().expect("coordinator sockets should be present");
             let data_socket = engine.data_sockets.first_mut().expect("data socket");
@@ -650,7 +680,8 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
     let engine1_task = tokio::spawn({
         let handshake_address = handshake_address.clone();
         async move {
-            let mut engine = setup_mock_engine_sockets(handshake_address, &[0x01, 0x00]).await;
+            let mut engine =
+                setup_two_rank_mock_engine_sockets(handshake_address, &[0x01, 0x00], 1).await;
             let mut coordinator =
                 engine.coordinator.take().expect("coordinator sockets should be present");
             let data_socket = engine.data_sockets.first_mut().expect("data socket");
@@ -770,7 +801,8 @@ async fn coordinator_rebroadcasts_engine_start_wave_control() {
     let engine0_task = tokio::spawn({
         let handshake_address = handshake_address.clone();
         async move {
-            let mut engine = setup_mock_engine_sockets(handshake_address, &[0x00, 0x00]).await;
+            let mut engine =
+                setup_two_rank_mock_engine_sockets(handshake_address, &[0x00, 0x00], 0).await;
             let mut coordinator =
                 engine.coordinator.take().expect("coordinator sockets should be present");
 
@@ -785,7 +817,8 @@ async fn coordinator_rebroadcasts_engine_start_wave_control() {
     let engine1_task = tokio::spawn({
         let handshake_address = handshake_address.clone();
         async move {
-            let mut engine = setup_mock_engine_sockets(handshake_address, &[0x01, 0x00]).await;
+            let mut engine =
+                setup_two_rank_mock_engine_sockets(handshake_address, &[0x01, 0x00], 1).await;
             let mut coordinator =
                 engine.coordinator.take().expect("coordinator sockets should be present");
 
@@ -1760,6 +1793,7 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
     let (init_rx_0, shutdown_tx_0, engine_task_0) = spawn_mock_engine_task_with_init(
         handshake_address.clone(),
         b"engine-0".to_vec(),
+        0,
         |dealer, push| {
             Box::pin(async move {
                 let add_1 = recv_engine_message(dealer).await;
@@ -1809,6 +1843,7 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
     let (init_rx_1, shutdown_tx_1, engine_task_1) = spawn_mock_engine_task_with_init(
         handshake_address.clone(),
         b"engine-1".to_vec(),
+        1,
         |dealer, push| {
             Box::pin(async move {
                 let add_2 = recv_engine_message(dealer).await;
@@ -1930,9 +1965,10 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
 
-    let (shutdown_tx_0, engine_task_0) = spawn_mock_engine_task(
+    let (shutdown_tx_0, engine_task_0) = spawn_two_rank_mock_engine_task(
         handshake_address.clone(),
         EngineId::from_engine_index(0).into_frame().to_vec(),
+        0,
         |dealer, push| {
             Box::pin(async move {
                 let utility = recv_engine_message(dealer).await;
@@ -1986,9 +2022,10 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
         },
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let (shutdown_tx_1, engine_task_1) = spawn_mock_engine_task(
+    let (shutdown_tx_1, engine_task_1) = spawn_two_rank_mock_engine_task(
         handshake_address.clone(),
         EngineId::from_engine_index(1).into_frame().to_vec(),
+        1,
         |dealer, push| {
             Box::pin(async move {
                 let utility = recv_engine_message(dealer).await;
@@ -2099,9 +2136,10 @@ async fn collective_rpc_flattens_results_from_all_engines() {
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
 
-    let (shutdown_tx_0, engine_task_0) = spawn_mock_engine_task(
+    let (shutdown_tx_0, engine_task_0) = spawn_two_rank_mock_engine_task(
         handshake_address.clone(),
         b"engine-0".to_vec(),
+        0,
         |dealer, push| {
             Box::pin(async move {
                 let utility = recv_engine_message(dealer).await;
@@ -2132,9 +2170,10 @@ async fn collective_rpc_flattens_results_from_all_engines() {
         },
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let (shutdown_tx_1, engine_task_1) = spawn_mock_engine_task(
+    let (shutdown_tx_1, engine_task_1) = spawn_two_rank_mock_engine_task(
         handshake_address.clone(),
         b"engine-1".to_vec(),
+        1,
         |dealer, push| {
             Box::pin(async move {
                 let utility = recv_engine_message(dealer).await;
@@ -2207,6 +2246,7 @@ async fn collective_rpc_flattens_results_from_all_engines() {
 fn spawn_mock_utility_engine(
     handshake_address: String,
     engine_id: Vec<u8>,
+    rank: u32,
     expected_method: &'static str,
     expected_args: Value,
     result: bool,
@@ -2214,7 +2254,7 @@ fn spawn_mock_utility_engine(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    spawn_mock_engine_task(handshake_address, engine_id, move |dealer, push| {
+    spawn_two_rank_mock_engine_task(handshake_address, engine_id, rank, move |dealer, push| {
         Box::pin(async move {
             let utility = recv_engine_message(dealer).await;
             assert_eq!(utility[0].as_ref(), &[0x03]);
@@ -2254,6 +2294,7 @@ async fn is_sleeping_returns_error_when_engines_disagree() {
     let (shutdown_tx_0, engine_task_0) = spawn_mock_utility_engine(
         handshake_address.clone(),
         b"engine-0".to_vec(),
+        0,
         "is_sleeping",
         Value::Array(vec![]),
         true,
@@ -2261,6 +2302,7 @@ async fn is_sleeping_returns_error_when_engines_disagree() {
     let (shutdown_tx_1, engine_task_1) = spawn_mock_utility_engine(
         handshake_address.clone(),
         b"engine-1".to_vec(),
+        1,
         "is_sleeping",
         Value::Array(vec![]),
         false,
@@ -2304,6 +2346,7 @@ async fn is_sleeping_returns_value_when_all_engines_agree() {
     let (shutdown_tx_0, engine_task_0) = spawn_mock_utility_engine(
         handshake_address.clone(),
         b"engine-0".to_vec(),
+        0,
         "is_sleeping",
         Value::Array(vec![]),
         true,
@@ -2311,6 +2354,7 @@ async fn is_sleeping_returns_value_when_all_engines_agree() {
     let (shutdown_tx_1, engine_task_1) = spawn_mock_utility_engine(
         handshake_address.clone(),
         b"engine-1".to_vec(),
+        1,
         "is_sleeping",
         Value::Array(vec![]),
         true,
@@ -2347,6 +2391,7 @@ async fn reset_prefix_cache_returns_true_when_all_engines_succeed() {
     let (shutdown_tx_0, engine_task_0) = spawn_mock_utility_engine(
         handshake_address.clone(),
         b"engine-0".to_vec(),
+        0,
         "reset_prefix_cache",
         Value::Array(vec![Value::from(false), Value::from(false)]),
         true,
@@ -2354,6 +2399,7 @@ async fn reset_prefix_cache_returns_true_when_all_engines_succeed() {
     let (shutdown_tx_1, engine_task_1) = spawn_mock_utility_engine(
         handshake_address.clone(),
         b"engine-1".to_vec(),
+        1,
         "reset_prefix_cache",
         Value::Array(vec![Value::from(false), Value::from(false)]),
         true,
@@ -2390,6 +2436,7 @@ async fn reset_prefix_cache_returns_false_when_any_engine_fails() {
     let (shutdown_tx_0, engine_task_0) = spawn_mock_utility_engine(
         handshake_address.clone(),
         b"engine-0".to_vec(),
+        0,
         "reset_prefix_cache",
         Value::Array(vec![Value::from(false), Value::from(false)]),
         true,
@@ -2397,6 +2444,7 @@ async fn reset_prefix_cache_returns_false_when_any_engine_fails() {
     let (shutdown_tx_1, engine_task_1) = spawn_mock_utility_engine(
         handshake_address.clone(),
         b"engine-1".to_vec(),
+        1,
         "reset_prefix_cache",
         Value::Array(vec![Value::from(false), Value::from(false)]),
         false,
@@ -2682,14 +2730,20 @@ async fn bootstrapped_connects_with_contiguous_engine_ids() {
         }
     });
 
-    let (_dealer0, _push0) = setup_bootstrapped_mock_engine(
+    let (_dealer0, _push0) = setup_bootstrapped_mock_engine_with_ready(
         input_address.clone(),
         output_address.clone(),
         &[0x00, 0x00],
+        two_rank_ready(0),
     )
     .await;
-    let (_dealer1, _push1) =
-        setup_bootstrapped_mock_engine(input_address, output_address, &[0x01, 0x00]).await;
+    let (_dealer1, _push1) = setup_bootstrapped_mock_engine_with_ready(
+        input_address,
+        output_address,
+        &[0x01, 0x00],
+        two_rank_ready(1),
+    )
+    .await;
     let client = client_task.await.unwrap();
 
     assert_eq!(client.engine_count(), 2);

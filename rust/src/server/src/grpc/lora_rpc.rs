@@ -6,7 +6,7 @@ use vllm_engine_core_client::protocol::lora::LoraRequest;
 
 use super::pb;
 use crate::lora::{LoadExactLoraError, UnloadLoraError};
-use crate::routes::{runtime_lora_allowed_path_prefixes, validate_lora_path_access};
+use crate::lora_path::validate_lora_path_access;
 use crate::state::AppState;
 
 fn ensure_enabled(state: &AppState) -> Result<(), Status> {
@@ -26,6 +26,7 @@ fn ensure_consistent(state: &AppState) -> Result<(), Status> {
 
 pub(super) async fn load_lora(
     state: &std::sync::Arc<AppState>,
+    allowed_path_prefixes: Option<&[std::path::PathBuf]>,
     request: Request<pb::LoadLoraRequest>,
 ) -> Result<Response<pb::LoadLoraResponse>, Status> {
     ensure_enabled(state)?;
@@ -34,6 +35,7 @@ pub(super) async fn load_lora(
     let load_inplace = request.load_inplace;
     let adapter = normalize_adapter(
         request.adapter.ok_or_else(|| Status::invalid_argument("adapter is required"))?,
+        allowed_path_prefixes,
     )
     .await?;
     let (adapter, already_loaded) =
@@ -109,7 +111,10 @@ pub(super) async fn list_loras(
     Ok(Response::new(pb::ListLorasResponse { adapters }))
 }
 
-async fn normalize_adapter(adapter: pb::LoraAdapter) -> Result<LoraRequest, Status> {
+async fn normalize_adapter(
+    adapter: pb::LoraAdapter,
+    allowed_path_prefixes: Option<&[std::path::PathBuf]>,
+) -> Result<LoraRequest, Status> {
     if adapter.lora_id <= 0 {
         return Err(Status::invalid_argument("lora_id must be positive"));
     }
@@ -120,20 +125,17 @@ async fn normalize_adapter(adapter: pb::LoraAdapter) -> Result<LoraRequest, Stat
     if !path.is_absolute() {
         return Err(Status::invalid_argument("source_path must be absolute"));
     }
-    let canonical = validate_lora_path_access(
-        &adapter.source_path,
-        runtime_lora_allowed_path_prefixes().as_deref(),
-    )
-    .map_err(|error| {
-        let message = error.to_error_response().error.message;
-        if error.status_code().is_client_error() {
-            Status::invalid_argument(message)
-        } else {
-            Status::internal(message)
-        }
-    })?
-    .ok_or_else(|| Status::invalid_argument("source_path must be a local path"))?;
-    let canonical = Path::new(&canonical);
+    let canonical = validate_lora_path_access(&adapter.source_path, allowed_path_prefixes)
+        .await
+        .map_err(|error| {
+            if error.is_client_error() {
+                Status::invalid_argument(error.public_message())
+            } else {
+                tracing::error!(error = %error, "runtime LoRA path policy validation failed");
+                Status::internal(error.public_message())
+            }
+        })?
+        .ok_or_else(|| Status::invalid_argument("source_path must be a local path"))?;
     let metadata = tokio::fs::metadata(&canonical)
         .await
         .map_err(|error| Status::invalid_argument(format!("invalid source_path: {error}")))?;

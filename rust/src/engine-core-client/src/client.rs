@@ -199,6 +199,7 @@ pub struct EngineCoreClient {
     input_address: String,
     output_address: String,
     engines: Vec<ConnectedEngine>,
+    managed_data_parallel_span: transport::ManagedDataParallelSpan,
     inner: Arc<ClientInner>,
     coordinator: Option<CoordinatorHandle>,
     abort_tx: mpsc::UnboundedSender<AbortRequest>,
@@ -309,6 +310,7 @@ impl EngineCoreClient {
         let (output_tx, output_rx) = mpsc::channel(64);
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let engines = connected.engines;
+        let managed_data_parallel_span = connected.managed_data_parallel_span;
         let runtime = build_zmq_runtime();
         let inner = Arc::new(ClientInner::new(
             connected.input_send,
@@ -368,6 +370,7 @@ impl EngineCoreClient {
             input_address: connected.input_address,
             output_address: connected.output_address,
             engines,
+            managed_data_parallel_span,
             inner,
             coordinator,
             abort_tx,
@@ -395,6 +398,15 @@ impl EngineCoreClient {
     /// Return the number of engines connected to this client.
     pub fn engine_count(&self) -> usize {
         self.engines.len()
+    }
+
+    /// Return the first rank and number of contiguous data-parallel ranks
+    /// validated during the engine transport handshake.
+    pub fn managed_data_parallel_span(&self) -> (u32, u32) {
+        (
+            self.managed_data_parallel_span.start_rank,
+            self.managed_data_parallel_span.size,
+        )
     }
 
     #[cfg(test)]

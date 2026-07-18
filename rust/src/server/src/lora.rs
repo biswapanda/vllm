@@ -228,15 +228,17 @@ impl LoraManager {
         let lease = previous
             .map(|(_, lease)| lease)
             .unwrap_or_else(|| std::sync::Arc::new(RwLock::new(())));
+        let mut stored_request = lora_request;
+        stored_request.load_inplace = false;
         self.registry.write().await.insert(
             lora_name,
             LoadedLora {
-                request: lora_request.clone(),
+                request: stored_request.clone(),
                 lease,
             },
         );
         mutation.prove_final_state();
-        Ok(lora_request)
+        Ok(stored_request)
     }
 
     /// Load an adapter with a caller-supplied ID.
@@ -269,7 +271,7 @@ impl LoraManager {
             });
         }
         let previous = if let Some(existing) = same_name {
-            if same_wire_identity(&existing.request, &lora_request) {
+            if same_wire_identity(&existing.request, &lora_request) && !load_inplace {
                 return Ok((existing.request.clone(), true));
             }
             if !load_inplace
@@ -307,6 +309,7 @@ impl LoraManager {
             })?;
 
         self.id_counter.fetch_max(lora_request.lora_int_id, Ordering::Relaxed);
+        lora_request.load_inplace = false;
         self.registry.write().await.insert(
             lora_request.lora_name.clone(),
             LoadedLora {
@@ -513,6 +516,10 @@ async fn restore_load_state(
     previous: Option<&LoraRequest>,
 ) -> bool {
     match previous {
+        // Reloading the same path cannot restore old bytes after an in-place
+        // filesystem update. Leave the manager inconsistent so serving fails
+        // closed until restart.
+        Some(previous) if previous.lora_path == attempted.lora_path => false,
         Some(previous) => restore_previous_on_all(engine_core_client, previous).await,
         None => remove_from_all(engine_core_client, attempted.lora_int_id).await,
     }
@@ -722,63 +729,6 @@ mod tests {
         task_one.await.unwrap();
         client.shutdown().await.unwrap();
     }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exact_load_inplace_replaces_path_while_preserving_name_and_id() {
-        let ipc = IpcNamespace::new().unwrap();
-        let handshake = ipc.handshake_endpoint();
-        let (shutdown, task) = spawn_mock_engine_task_with_ready(
-            handshake.clone(),
-            vec![0x00, 0x00],
-            vllm_engine_core_client::mock_engine::default_ready_response(),
-            |dealer, push| {
-                Box::pin(async move {
-                    for _ in 0..2 {
-                        let load = recv_utility_call_id(dealer, "add_lora").await;
-                        reply_utility(push, load, true).await;
-                    }
-                })
-            },
-        );
-        let config = EngineCoreClientConfig::new_single(handshake)
-            .with_model_name("test-model")
-            .with_local_input_output_addresses(
-                Some(ipc.input_endpoint()),
-                Some(ipc.output_endpoint()),
-            );
-        let client = EngineCoreClient::connect(config).await.unwrap();
-        let manager = LoraManager::new();
-        let first = LoraRequest::new(
-            "adapter-a".to_string(),
-            17,
-            "/adapters/step-1".to_string(),
-            false,
-            false,
-        );
-        manager
-            .load_lora_exact(&client, &["test-model".to_string()], first, false)
-            .await
-            .unwrap();
-        let second = LoraRequest::new(
-            "adapter-a".to_string(),
-            17,
-            "/adapters/step-2".to_string(),
-            false,
-            false,
-        );
-        manager
-            .load_lora_exact(&client, &["test-model".to_string()], second, true)
-            .await
-            .unwrap();
-
-        let loaded = manager.served_lora_requests().await;
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].lora_name, "adapter-a");
-        assert_eq!(loaded[0].lora_int_id, 17);
-        assert_eq!(loaded[0].lora_path, "/adapters/step-2");
-
-        let _ = shutdown.send(());
-        task.await.unwrap();
-        client.shutdown().await.unwrap();
-    }
+    #[path = "inplace.rs"]
+    mod inplace;
 }

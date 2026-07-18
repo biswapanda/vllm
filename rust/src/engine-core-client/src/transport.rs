@@ -118,6 +118,8 @@ pub struct ConnectedTransport {
     pub output_address: String,
     /// All engines connected through the startup handshake.
     pub engines: Vec<ConnectedEngine>,
+    /// Validated contiguous data-parallel rank span managed by this transport.
+    pub managed_data_parallel_span: ManagedDataParallelSpan,
     /// Optional engine-facing coordinator transport used for in-process wave
     /// coordination.
     pub coordinator: Option<CoordinatorBootstrap>,
@@ -126,6 +128,13 @@ pub struct ConnectedTransport {
     pub input_send: RouterSendHalf,
     /// The shared output socket for receiving responses from all engines.
     pub output_socket: PullSocket,
+}
+
+/// Data-parallel ranks owned by one validated engine transport.
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedDataParallelSpan {
+    pub start_rank: u32,
+    pub size: u32,
 }
 
 #[derive(Clone, Debug, EnumAsInner)]
@@ -295,7 +304,7 @@ pub async fn connect_handshake(
     }
 
     // 6. Wait for every engine to connect to the shared input socket and register itself.
-    let engines =
+    let (engines, managed_data_parallel_span) =
         wait_for_input_registrations(&mut input_socket, engines.into_keys(), ready_timeout).await?;
     debug!(
         engine_count = engines.len(),
@@ -312,6 +321,7 @@ pub async fn connect_handshake(
         input_send,
         output_socket,
         engines,
+        managed_data_parallel_span,
         coordinator,
     })
 }
@@ -340,7 +350,7 @@ pub async fn connect_bootstrapped(
     let mut output_socket = PullSocket::new();
     let output_address = output_socket.bind(output_address).await?.to_string();
 
-    let engines = wait_for_input_registrations(
+    let (engines, managed_data_parallel_span) = wait_for_input_registrations(
         &mut input_socket,
         (0..engine_count)
             .map(|offset| EngineId::from_engine_index(engine_start_index + offset as u32)),
@@ -358,6 +368,7 @@ pub async fn connect_bootstrapped(
         input_address,
         output_address,
         engines,
+        managed_data_parallel_span,
         coordinator: None,
         input_send,
         output_socket,
@@ -448,7 +459,7 @@ async fn wait_for_input_registrations(
     input_socket: &mut RouterSocket,
     expected_engines: impl IntoIterator<Item = EngineId>,
     ready_timeout: Duration,
-) -> Result<Vec<ConnectedEngine>> {
+) -> Result<(Vec<ConnectedEngine>, ManagedDataParallelSpan)> {
     let expected_engines = expected_engines.into_iter().collect::<Vec<_>>();
     let mut pending = expected_engines.iter().cloned().collect::<BTreeSet<_>>();
     let mut ready_responses = BTreeMap::new();
@@ -502,13 +513,13 @@ async fn wait_for_input_registrations(
             }
         })
         .collect::<Vec<_>>();
-    validate_ready_responses(&engines)?;
-    Ok(engines)
+    let managed_data_parallel_span = validate_ready_responses(&engines)?;
+    Ok((engines, managed_data_parallel_span))
 }
 
 /// Validate the private engine/frontend startup contract before publishing a
 /// client. Incomplete or internally inconsistent metadata is a startup error.
-fn validate_ready_responses(engines: &[ConnectedEngine]) -> Result<()> {
+fn validate_ready_responses(engines: &[ConnectedEngine]) -> Result<ManagedDataParallelSpan> {
     let Some(first) = engines.first() else {
         bail_unexpected_handshake_message!("no engine ready responses were received");
     };
@@ -538,7 +549,7 @@ fn validate_ready_responses(engines: &[ConnectedEngine]) -> Result<()> {
                 response.data_parallel_size
             );
         }
-        if response.data_parallel_size > 1 && !ranks.insert(response.data_parallel_rank) {
+        if !ranks.insert(response.data_parallel_rank) {
             bail_unexpected_handshake_message!(
                 "duplicate data-parallel rank {} in engine ready responses",
                 response.data_parallel_rank
@@ -588,7 +599,23 @@ fn validate_ready_responses(engines: &[ConnectedEngine]) -> Result<()> {
         }
     }
 
-    Ok(())
+    let start_rank =
+        *ranks.first().expect("non-empty engines produce non-empty data-parallel ranks");
+    let Ok(size) = u32::try_from(ranks.len()) else {
+        bail_unexpected_handshake_message!("managed data-parallel rank count exceeds u32");
+    };
+    for (offset, rank) in ranks.into_iter().enumerate() {
+        let Ok(offset) = u32::try_from(offset) else {
+            bail_unexpected_handshake_message!("managed data-parallel rank count exceeds u32");
+        };
+        if start_rank.checked_add(offset) != Some(rank) {
+            bail_unexpected_handshake_message!(
+                "managed data-parallel ranks must be contiguous, starting at rank {start_rank}"
+            );
+        }
+    }
+
+    Ok(ManagedDataParallelSpan { start_rank, size })
 }
 
 /// Send an encoded message to the engine through the input socket.
@@ -698,6 +725,36 @@ mod tests {
     }
 
     #[test]
+    fn ready_validation_accepts_contiguous_offset_data_parallel_ranks() {
+        let engines = [2, 3].map(|rank| {
+            let mut ready_response = default_ready_response();
+            ready_response.data_parallel_size = 4;
+            ready_response.data_parallel_rank = rank;
+            ConnectedEngine {
+                engine_id: EngineId::from_engine_index(rank),
+                ready_response,
+            }
+        });
+        let span = validate_ready_responses(&engines).expect("contiguous offset ranks are valid");
+        assert_eq!(span.start_rank, 2);
+        assert_eq!(span.size, 2);
+    }
+
+    #[test]
+    fn ready_validation_rejects_noncontiguous_data_parallel_ranks() {
+        let engines = [0, 2].map(|rank| {
+            let mut ready_response = default_ready_response();
+            ready_response.data_parallel_size = 4;
+            ready_response.data_parallel_rank = rank;
+            ConnectedEngine {
+                engine_id: EngineId::from_engine_index(rank),
+                ready_response,
+            }
+        });
+        assert!(validate_ready_responses(&engines).is_err());
+    }
+
+    #[test]
     fn ready_validation_rejects_duplicate_data_parallel_ranks() {
         let engines = [0, 1].map(|rank| {
             let mut ready_response = default_ready_response();
@@ -706,6 +763,15 @@ mod tests {
                 engine_id: EngineId::from_engine_index(rank),
                 ready_response,
             }
+        });
+        assert!(validate_ready_responses(&engines).is_err());
+    }
+
+    #[test]
+    fn ready_validation_rejects_duplicate_rank_for_single_rank_topology() {
+        let engines = [0, 1].map(|engine_index| ConnectedEngine {
+            engine_id: EngineId::from_engine_index(engine_index),
+            ready_response: default_ready_response(),
         });
         assert!(validate_ready_responses(&engines).is_err());
     }

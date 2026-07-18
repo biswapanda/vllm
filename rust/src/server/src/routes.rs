@@ -5,7 +5,6 @@ mod health;
 mod inference;
 mod load;
 mod lora;
-pub(crate) use lora::{runtime_lora_allowed_path_prefixes, validate_lora_path_access};
 mod metrics;
 pub(crate) mod openai;
 mod pause;
@@ -37,7 +36,7 @@ fn server_dev_mode_enabled() -> bool {
         .is_some_and(|value| value != 0)
 }
 
-fn runtime_lora_updating_enabled() -> bool {
+pub(crate) fn runtime_lora_updating_enabled() -> bool {
     std::env::var("VLLM_ALLOW_RUNTIME_LORA_UPDATING")
         .ok()
         .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true"))
@@ -99,7 +98,6 @@ fn build_router_with_options(
             .route("/reset_mm_cache", post(cache::reset_mm_cache))
             .route("/reset_encoder_cache", post(cache::reset_encoder_cache))
             .route("/collective_rpc", post(collective_rpc::collective_rpc))
-            .route("/update_weights", post(collective_rpc::update_weights))
             .route("/abort_requests", post(abort_requests::abort_requests))
             .route("/sleep", post(sleep::sleep))
             .route("/wake_up", post(sleep::wake_up))

@@ -4,6 +4,7 @@ mod convert;
 mod lora_rpc;
 mod struct_json;
 
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,6 +20,7 @@ use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_text::{DecodedTextEvent, Prompt, TextOutputStreamExt as _, TextRequest};
 
 use self::convert::ResponseOpts;
+use crate::lora_path::runtime_lora_allowed_path_prefixes;
 use crate::state::AppState;
 
 /// Generated protobuf/gRPC types for the `vllm` package.
@@ -37,6 +39,8 @@ mod tests;
 pub struct GenerateServiceImpl {
     state: Arc<AppState>,
     admission: Arc<AdmissionState>,
+    lora_allowed_path_prefixes: Option<Arc<[PathBuf]>>,
+    runtime_lora_updating_enabled: bool,
 }
 
 impl GenerateServiceImpl {
@@ -44,7 +48,21 @@ impl GenerateServiceImpl {
         Self {
             state,
             admission: Arc::new(AdmissionState::default()),
+            lora_allowed_path_prefixes: runtime_lora_allowed_path_prefixes().map(Arc::from),
+            runtime_lora_updating_enabled: crate::routes::runtime_lora_updating_enabled(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_lora_allowed_path_prefixes(mut self, prefixes: Vec<PathBuf>) -> Self {
+        self.lora_allowed_path_prefixes = Some(prefixes.into());
+        self
+    }
+
+    #[cfg(test)]
+    fn with_runtime_lora_updating(mut self, enabled: bool) -> Self {
+        self.runtime_lora_updating_enabled = enabled;
+        self
     }
 
     pub fn control_service(&self, health_reporter: Option<HealthReporter>) -> ControlServiceImpl {
@@ -52,6 +70,8 @@ impl GenerateServiceImpl {
             state: self.state.clone(),
             admission: self.admission.clone(),
             health_reporter,
+            lora_allowed_path_prefixes: self.lora_allowed_path_prefixes.clone(),
+            runtime_lora_updating_enabled: self.runtime_lora_updating_enabled,
         }
     }
 }
@@ -150,6 +170,8 @@ pub struct ControlServiceImpl {
     state: Arc<AppState>,
     admission: Arc<AdmissionState>,
     health_reporter: Option<HealthReporter>,
+    lora_allowed_path_prefixes: Option<Arc<[PathBuf]>>,
+    runtime_lora_updating_enabled: bool,
 }
 
 impl ControlServiceImpl {
@@ -169,13 +191,16 @@ impl ControlServiceImpl {
 
     fn parallelism_info(&self) -> pb::ParallelismInfo {
         let ready = self.ready();
+        let (data_parallel_start_rank, managed_data_parallel_size) =
+            self.state.engine_core_client().managed_data_parallel_span();
         pb::ParallelismInfo {
             tensor_parallel_size: ready.tensor_parallel_size,
             pipeline_parallel_size: ready.pipeline_parallel_size,
             data_parallel_size: ready.data_parallel_size.min(u64::from(u32::MAX)) as u32,
             data_parallel_rank: ready.data_parallel_rank,
-            data_parallel_start_rank: ready.data_parallel_rank,
+            data_parallel_start_rank,
             decode_context_parallel_size: ready.decode_context_parallel_size,
+            managed_data_parallel_size,
         }
     }
 
@@ -418,16 +443,31 @@ impl pb::control_server::Control for ControlServiceImpl {
         &self,
         request: Request<pb::LoadLoraRequest>,
     ) -> Result<Response<pb::LoadLoraResponse>, Status> {
+        if !self.runtime_lora_updating_enabled {
+            return Err(Status::failed_precondition(
+                "runtime LoRA updating is disabled",
+            ));
+        }
         let _guard = self
             .try_admit()
             .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
-        lora_rpc::load_lora(&self.state, request).await
+        lora_rpc::load_lora(
+            &self.state,
+            self.lora_allowed_path_prefixes.as_deref(),
+            request,
+        )
+        .await
     }
 
     async fn unload_lora(
         &self,
         request: Request<pb::UnloadLoraRequest>,
     ) -> Result<Response<pb::UnloadLoraResponse>, Status> {
+        if !self.runtime_lora_updating_enabled {
+            return Err(Status::failed_precondition(
+                "runtime LoRA updating is disabled",
+            ));
+        }
         let _guard = self
             .try_admit()
             .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
