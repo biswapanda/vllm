@@ -472,19 +472,27 @@ fn positions_to_proto(
         if let Some(first) = pos.entries.first() {
             logprobs.push(first.logprob);
             ranks.push(first.rank);
-        }
 
-        // Extra candidates beyond the first.
-        let entries = pos.entries.iter().skip(1);
-        candidates.push(pb::CandidateTokenInfo {
-            tokens: entries
-                .map(|e| pb::candidate_token_info::TokenInfo {
-                    id: e.token_id,
-                    logprob: e.logprob,
-                    rank: e.rank,
-                })
-                .collect(),
-        });
+            // Engine-core can include the sampled token again in its top-k
+            // alternatives. The gRPC schema carries that token separately in
+            // the parallel token_ids/logprobs/ranks fields, so do not repeat it
+            // in CandidateTokenInfo (whose contract is alternatives only).
+            candidates.push(pb::CandidateTokenInfo {
+                tokens: pos
+                    .entries
+                    .iter()
+                    .skip(1)
+                    .filter(|entry| entry.token_id != first.token_id)
+                    .map(|entry| pb::candidate_token_info::TokenInfo {
+                        id: entry.token_id,
+                        logprob: entry.logprob,
+                        rank: entry.rank,
+                    })
+                    .collect(),
+            });
+        } else {
+            candidates.push(pb::CandidateTokenInfo { tokens: vec![] });
+        }
     }
 
     (logprobs, ranks, candidates)
@@ -525,7 +533,10 @@ impl ResponseOpts {
 #[cfg(test)]
 mod tests {
     use vllm_engine_core_client::protocol::output::StopReason;
-    use vllm_text::{FinishReason, Finished, Prompt};
+    use vllm_text::{
+        DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob, FinishReason, Finished,
+        Prompt,
+    };
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
     use super::{
@@ -744,5 +755,52 @@ mod tests {
         let finish = out.finish_info.expect("finish_info should be present");
         assert_eq!(finish.finish_reason, PbFinishReason::Stop as i32);
         assert_eq!(finish.stop_reason, Some(PbStopReason::EosTokenId(30)));
+    }
+
+    #[test]
+    fn output_logprobs_do_not_repeat_the_sampled_token_as_a_candidate() {
+        let logprobs = DecodedLogprobs {
+            positions: vec![DecodedPositionLogprobs {
+                entries: vec![
+                    DecodedTokenLogprob {
+                        token_id: 42,
+                        token: "sampled".into(),
+                        logprob: -0.1,
+                        rank: 1,
+                    },
+                    DecodedTokenLogprob {
+                        token_id: 42,
+                        token: "sampled".into(),
+                        logprob: -0.1,
+                        rank: 1,
+                    },
+                    DecodedTokenLogprob {
+                        token_id: 7,
+                        token: "alternate".into(),
+                        logprob: -1.2,
+                        rank: 2,
+                    },
+                ],
+            }],
+        };
+        let opts = ResponseOpts {
+            output_token_ids: true,
+            output_logprobs: true,
+            ..Default::default()
+        };
+
+        let output = to_sequence_output("sampled", &[42], Some(&logprobs), None, &opts);
+
+        assert_eq!(output.logprobs, vec![-0.1]);
+        assert_eq!(output.ranks, vec![1]);
+        assert_eq!(output.candidate_tokens.len(), 1);
+        assert_eq!(
+            output.candidate_tokens[0]
+                .tokens
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
     }
 }
