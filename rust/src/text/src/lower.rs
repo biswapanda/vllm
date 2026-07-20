@@ -92,6 +92,7 @@ pub fn lower_sampling_params(
         max_tokens,
         min_tokens,
         thinking_token_budget,
+        routed_experts_prompt_start,
         logprobs,
         prompt_logprobs,
         min_p,
@@ -164,6 +165,7 @@ pub fn lower_sampling_params(
         max_tokens,
         min_tokens,
         thinking_token_budget,
+        routed_experts_prompt_start,
         logprobs,
         prompt_logprobs,
         min_p,
@@ -480,6 +482,20 @@ mod tests {
     }
 
     #[test]
+    fn lower_sampling_params_forwards_routed_experts_prompt_start() {
+        let lowered = lower_sampling_params_with_limits(
+            SamplingParams {
+                routed_experts_prompt_start: 23,
+                ..SamplingParams::default()
+            },
+            sample_sampling_limits(),
+        )
+        .unwrap();
+
+        assert_eq!(lowered.routed_experts_prompt_start, 23);
+    }
+
+    #[test]
     fn lower_text_request_applies_python_style_eos_hints() {
         let prepared = lower_text_request(
             sample_request(),
@@ -500,6 +516,7 @@ mod tests {
                 max_tokens: 999997,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.0,
@@ -553,6 +570,7 @@ mod tests {
                 max_tokens: 999997,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.0,
@@ -714,6 +732,7 @@ mod tests {
                 max_tokens: 40957,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.0,
@@ -777,6 +796,7 @@ mod tests {
                 max_tokens: 999997,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.0,
@@ -848,6 +868,7 @@ mod tests {
                 max_tokens: 32,
                 min_tokens: 2,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.1,
@@ -1097,6 +1118,7 @@ mod tests {
                 max_tokens: 128,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.1,

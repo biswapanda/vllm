@@ -690,6 +690,7 @@ mod tests {
                         "repetition_detected".to_string(),
                     ))),
                     kv_transfer_params: None,
+                    routed_experts: None,
                 }),
             }),
         ]);
@@ -794,6 +795,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    routed_experts: None,
                 }),
             }),
         ]);
@@ -845,6 +847,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    routed_experts: None,
                 }),
             }),
         ]);
@@ -899,6 +902,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    routed_experts: None,
                 }),
             }),
         ]);
@@ -970,6 +974,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    routed_experts: None,
                 }),
             }),
         ]);
@@ -1043,6 +1048,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    routed_experts: None,
                 }),
             }),
         ]);

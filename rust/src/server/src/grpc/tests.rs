@@ -814,8 +814,8 @@ async fn unary_generate_with_sampling_params() {
             prompt: Some(pb::generate_request::Prompt::Text("test".to_string())),
             temperature: Some(0.7),
             sampling: Some(pb::RandomSampling {
-                top_k: 50,
-                top_p: 0.9,
+                top_k: Some(50),
+                top_p: Some(0.9),
                 seed: Some(42),
                 ..Default::default()
             }),
@@ -1140,6 +1140,14 @@ async fn discovery_and_lifecycle_methods_share_listener() {
 
     let server = client.get_server_info(pb::GetServerInfoRequest {}).await.unwrap().into_inner();
     assert_eq!(server.api_version, "vllm");
+    assert_eq!(
+        server.capabilities,
+        [
+            "generate.sampling.v2",
+            "generate.preprocessed_mm.v1",
+            "generate.routed_experts.v1",
+        ]
+    );
     assert_eq!(server.max_model_len, DEFAULT_MOCK_MAX_MODEL_LEN as u32);
     let parallelism = server.parallelism.expect("parallelism should be reported");
     assert_eq!(parallelism.tensor_parallel_size, 1);

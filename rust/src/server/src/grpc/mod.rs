@@ -139,7 +139,8 @@ impl GenerateServiceImpl {
                 Status::not_found(format!("LoRA adapter `{lora_name}` is not loaded"))
             })?);
         }
-
+        // Language-only LoRA does not change preprocessed multimodal features.
+        // Tower or connector adapters need an explicit cache-identity contract.
         if !media.is_empty() {
             let Prompt::TokenIds(mut token_ids) = text_request.prompt else {
                 return Err(Status::invalid_argument(
@@ -165,6 +166,11 @@ impl GenerateServiceImpl {
 }
 
 const GRPC_API_VERSION: &str = "vllm";
+const GRPC_CAPABILITIES: &[&str] = &[
+    "generate.sampling.v2",
+    "generate.preprocessed_mm.v1",
+    "generate.routed_experts.v1",
+];
 
 pub struct ControlServiceImpl {
     state: Arc<AppState>,
@@ -268,6 +274,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
             usage: collected.usage,
             finish_reason: collected.finish_reason,
             kv_transfer_params: collected.kv_transfer_params,
+            routed_experts: collected.routed_experts,
         };
 
         let outputs = convert::to_sequence_output(
@@ -372,6 +379,10 @@ impl pb::control_server::Control for ControlServiceImpl {
             max_running_requests: ready.max_num_seqs,
             max_batched_tokens: ready.max_num_batched_tokens,
             max_loras: ready.max_loras,
+            capabilities: GRPC_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
         }))
     }
 

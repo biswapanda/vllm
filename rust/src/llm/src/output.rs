@@ -8,7 +8,10 @@ use futures::stream::FusedStream;
 use futures::{Stream, StreamExt as _, pin_mut};
 use serde::{Deserialize, Serialize};
 use vllm_engine_core_client::protocol::logprobs::Logprobs;
-use vllm_engine_core_client::protocol::output::{EngineCoreFinishReason, StopReason};
+use vllm_engine_core_client::protocol::output::{
+    EngineCoreFinishReason, StopReason, concatenate_routed_experts,
+};
+use vllm_engine_core_client::protocol::tensor::WireNdArray;
 use vllm_engine_core_client::{AbortCause, EngineCoreOutputStream};
 
 use crate::error::Result;
@@ -38,6 +41,8 @@ pub struct CollectedGenerateOutput {
     pub usage: TokenUsage,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Routed-expert IDs concatenated along the token axis.
+    pub routed_experts: Option<WireNdArray>,
 }
 
 /// Prompt-scoped metadata emitted only once on the first [`GenerateOutput`] for
@@ -146,6 +151,8 @@ pub struct GenerateOutput {
     pub cached_token_count: usize,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Routed-expert IDs emitted by engine-core for this output chunk.
+    pub routed_experts: Option<WireNdArray>,
 }
 
 impl GenerateOutput {
@@ -192,6 +199,7 @@ impl GenerateOutput {
             finish_reason,
             cached_token_count: 0,
             kv_transfer_params: None,
+            routed_experts: None,
         }
     }
 }
@@ -280,6 +288,7 @@ impl Stream for GenerateOutputStream {
             finish_reason,
             cached_token_count,
             kv_transfer_params: raw.kv_transfer_params,
+            routed_experts: raw.routed_experts,
         };
 
         Poll::Ready(Some(Ok(output)))
@@ -326,9 +335,13 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
             let mut prompt_token_ids = None;
             let mut prompt_logprobs = None;
             let mut cached_token_count = 0;
+            let mut routed_experts_chunks = Vec::new();
             let mut collected: Option<CollectedGenerateOutput> = None;
 
             while let Some(output) = stream.next().await.transpose()? {
+                if let Some(routed_experts) = output.routed_experts {
+                    routed_experts_chunks.push(routed_experts);
+                }
                 cached_token_count = cached_token_count.max(output.cached_token_count);
                 if let Some(info) = output.prompt_info {
                     if prompt_token_ids.is_none() {
@@ -362,6 +375,7 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                             cached_token_count,
                         },
                         kv_transfer_params: None,
+                        routed_experts: None,
                     });
                 }
 
@@ -374,6 +388,7 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                         cached_token_count,
                     };
                     collected.kv_transfer_params = output.kv_transfer_params;
+                    collected.routed_experts = concatenate_routed_experts(routed_experts_chunks)?;
                     return Ok(collected);
                 }
             }

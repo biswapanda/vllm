@@ -5,7 +5,8 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
 use vllm_engine_core_client::AbortCause;
-use vllm_engine_core_client::protocol::output::StopReason;
+use vllm_engine_core_client::protocol::output::{StopReason, concatenate_routed_experts};
+use vllm_engine_core_client::protocol::tensor::WireNdArray;
 use vllm_llm::{FinishReason, GenerateOutput, TokenUsage};
 use vllm_tokenizer::{DynTokenizer, IncrementalDecoder};
 
@@ -44,6 +45,8 @@ pub struct Finished {
     pub finish_reason: FinishReason,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Routed-expert IDs concatenated along the token axis.
+    pub routed_experts: Option<WireNdArray>,
 }
 
 /// Internal decoded-text event emitted before higher-level assistant
@@ -101,9 +104,13 @@ pub async fn decoded_text_event_stream(
     let mut token_ids = Vec::new();
     let mut output_token_count: usize = 0;
     let mut logprobs: Option<DecodedLogprobs> = None;
+    let mut routed_experts_chunks = Vec::new();
 
     while let Some(next) = raw_stream.next().await {
-        let output = next?;
+        let mut output = next?;
+        if let Some(routed_experts) = output.routed_experts.take() {
+            routed_experts_chunks.push(routed_experts);
+        }
         cached_token_count = cached_token_count.max(output.cached_token_count);
 
         // If it's the first output, init states and yield `Start` event.
@@ -275,6 +282,7 @@ pub async fn decoded_text_event_stream(
                     },
                     finish_reason: reason,
                     kv_transfer_params,
+                    routed_experts: concatenate_routed_experts(routed_experts_chunks)?,
                 }),
             })
             .await;

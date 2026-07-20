@@ -387,6 +387,7 @@ mod tests {
                 usage: vllm_llm::TokenUsage::default(),
                 finish_reason: crate::FinishReason::Stop(None),
                 kv_transfer_params: None,
+                routed_experts: None,
             }),
         }
     }

@@ -52,6 +52,7 @@ fn finished() -> Finished {
         },
         finish_reason: FinishReason::stop_eos(),
         kv_transfer_params: None,
+        routed_experts: None,
     }
 }
 

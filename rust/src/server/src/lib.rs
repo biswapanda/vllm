@@ -51,6 +51,11 @@ use vllm_text::TextLlm;
 use crate::listener::{Listener, MaybeTlsListener};
 use crate::routes::build_router;
 use crate::server_info::ServerInfoSnapshot;
+
+// Preprocessed multimodal tensors are capped at 16 MiB; leave bounded room for
+// protobuf framing and ordinary request metadata without opening a 64 MiB
+// allocation-amplification surface on every Generate RPC.
+const GRPC_MAX_REQUEST_SIZE: usize = 20 * 1024 * 1024;
 use crate::state::AppState;
 
 /// How often the server PINGs an idle gRPC connection to reap a dead peer;
@@ -274,7 +279,8 @@ where
         let service = grpc::GenerateServiceImpl::new(state.clone());
         let control_service =
             grpc::ControlServer::new(service.control_service(Some(health_reporter.clone())));
-        let generate_service = grpc::GenerateServer::new(service);
+        let generate_service =
+            grpc::GenerateServer::new(service).max_decoding_message_size(GRPC_MAX_REQUEST_SIZE);
         let svc = TonicServer::builder()
             .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))

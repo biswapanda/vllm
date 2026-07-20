@@ -405,6 +405,7 @@ mod tests {
     async fn generate_chunk_stream_captures_late_prompt_info() {
         let stream = stream::iter(vec![
             Ok(GenerateOutput {
+                routed_experts: None,
                 request_id: String::new(),
                 prompt_info: None,
                 token_ids: Vec::new(),
@@ -414,6 +415,7 @@ mod tests {
                 kv_transfer_params: None,
             }),
             Ok(GenerateOutput {
+                routed_experts: None,
                 request_id: String::new(),
                 prompt_info: Some(GeneratePromptInfo {
                     prompt_token_ids: Arc::from([11_u32, 22_u32]),
