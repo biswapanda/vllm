@@ -29,14 +29,15 @@ pub use stream::{EngineCoreOutputStream, EngineCoreStreamOutput};
 /// `EngineCoreProc`s.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TransportMode {
-    /// The Rust process owns the startup handshake and allocates or binds the
-    /// frontend transport addresses itself before replying to engine
-    /// `HELLO` messages.
+    /// The Rust process is the sole owner of the startup handshake and
+    /// allocates or binds the frontend transport addresses itself. Exactly one
+    /// owner must bind the handshake endpoint for the complete engine cohort.
     HandshakeOwner {
         /// Shared handshake endpoint that engines dial during startup.
         handshake_address: String,
         /// Host/IP that engines should use to connect back to the frontend
-        /// transport sockets.
+        /// transport sockets. It must be locally bindable and routable from
+        /// every engine; coordinated DP also advertises it as the master IP.
         advertised_host: String,
         /// Total number of engines expected to join this transport.
         engine_count: usize,

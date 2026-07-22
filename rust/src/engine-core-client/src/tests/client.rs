@@ -582,9 +582,128 @@ async fn coordinator_handshake_includes_engine_control_addresses() {
     assert!(init.addresses.coordinator_input.is_some());
     assert!(init.addresses.coordinator_output.is_some());
     assert!(init.addresses.frontend_stats_publish_address.is_none());
+    assert!(init.parallel_config.is_empty());
 
     let _ = shutdown_tx.send(());
     engine_task.await.unwrap();
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_coordinator_handshake_omits_data_parallel_bootstrap() {
+    init_tracing();
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+
+    let (init0_rx, shutdown0_tx, engine0_task) =
+        spawn_mock_engine_task_with_init(handshake_address.clone(), &[0x00, 0x00], 0, |_, _| {
+            Box::pin(async {})
+        });
+    let (init1_rx, shutdown1_tx, engine1_task) =
+        spawn_mock_engine_task_with_init(handshake_address, &[0x01, 0x00], 1, |_, _| {
+            Box::pin(async {})
+        });
+
+    let client = connect_client_with_ipc(
+        handshake_test_config(
+            ipc.handshake_endpoint(),
+            2,
+            "test-model",
+            Duration::from_secs(2),
+            0,
+            None,
+        ),
+        &ipc,
+    )
+    .await;
+
+    assert!(init0_rx.await.unwrap().parallel_config.is_empty());
+    assert!(init1_rx.await.unwrap().parallel_config.is_empty());
+
+    let _ = shutdown0_tx.send(());
+    let _ = shutdown1_tx.send(());
+    engine0_task.await.unwrap();
+    engine1_task.await.unwrap();
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_handshake_shares_data_parallel_bootstrap() {
+    init_tracing();
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+    let advertised_host = "127.0.0.2";
+
+    let (init0_rx, shutdown0_tx, engine0_task) =
+        spawn_mock_engine_task_with_init(handshake_address.clone(), &[0x00, 0x00], 0, |_, _| {
+            Box::pin(async {})
+        });
+    let (init1_rx, shutdown1_tx, engine1_task) =
+        spawn_mock_engine_task_with_init(handshake_address, &[0x01, 0x00], 1, |_, _| {
+            Box::pin(async {})
+        });
+
+    let mut config = handshake_test_config(
+        ipc.handshake_endpoint(),
+        2,
+        "test-model",
+        Duration::from_secs(2),
+        0,
+        Some(CoordinatorMode::InProc),
+    );
+    let TransportMode::HandshakeOwner {
+        advertised_host: config_host,
+        ..
+    } = &mut config.transport_mode
+    else {
+        unreachable!("handshake_test_config returns handshake-owned transport")
+    };
+    *config_host = advertised_host.to_string();
+
+    let client = connect_client_with_ipc(config, &ipc).await;
+    let init0 = init0_rx.await.unwrap();
+    let init1 = init1_rx.await.unwrap();
+
+    assert_eq!(init0.parallel_config, init1.parallel_config);
+    assert_eq!(
+        init0.parallel_config.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec![
+            "_data_parallel_master_port_list",
+            "data_parallel_master_ip",
+            "data_parallel_master_port",
+            "data_parallel_size",
+        ]
+    );
+    assert_eq!(
+        init0.parallel_config["data_parallel_master_ip"].as_str(),
+        Some(advertised_host)
+    );
+    assert_eq!(
+        init0.parallel_config["data_parallel_size"].as_u64(),
+        Some(2)
+    );
+
+    let master_port = init0.parallel_config["data_parallel_master_port"]
+        .as_u64()
+        .expect("data_parallel_master_port must be an integer");
+    let remaining_ports = init0.parallel_config["_data_parallel_master_port_list"]
+        .as_array()
+        .expect("_data_parallel_master_port_list must be an array");
+    let ports = std::iter::once(master_port)
+        .chain(
+            remaining_ports
+                .iter()
+                .map(|port| port.as_u64().expect("bootstrap port must be an integer")),
+        )
+        .map(|port| u16::try_from(port).expect("bootstrap port must fit in u16"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(ports.len(), 5);
+    assert!(ports.iter().all(|port| *port != 0));
+
+    let _ = shutdown0_tx.send(());
+    let _ = shutdown1_tx.send(());
+    engine0_task.await.unwrap();
+    engine1_task.await.unwrap();
     client.shutdown().await.unwrap();
 }
 

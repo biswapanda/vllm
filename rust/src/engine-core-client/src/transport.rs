@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
+use std::net::TcpListener;
 use std::ops::Deref;
 use std::time::Duration;
 
@@ -19,11 +20,13 @@ use crate::protocol::handshake::{
     EngineCoreReadyResponse, HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
 };
 use crate::protocol::output::{EngineCoreOutputs, decode_engine_core_outputs};
-use crate::protocol::{decode_msgpack, encode_msgpack};
+use crate::protocol::{OpaqueValue, decode_msgpack, encode_msgpack};
 
 /// Dedicated single-frame sentinel emitted by Python `EngineCoreProc` when the
 /// engine dies.
 pub const ENGINE_CORE_DEAD_SENTINEL: &[u8] = b"ENGINE_CORE_DEAD";
+
+const DATA_PARALLEL_BOOTSTRAP_PORT_COUNT: usize = 5;
 
 /// Opaque routing identity of one engine on the frontend transport.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -187,9 +190,10 @@ pub async fn connect_handshake(
     handshake_socket.bind(handshake_address).await?;
 
     let mut engines = BTreeMap::new();
+    let empty_parallel_config = BTreeMap::new();
 
-    // 3. Receive HELLO from every engine and send a matching INIT. When coordinator mode is
-    //    enabled, the engines will not emit READY until the coordinator barrier below completes.
+    // 3. Receive HELLO from every engine. Non-coordinated engines receive INIT immediately. A
+    //    coordinated cohort receives one shared DP bootstrap after every expected HELLO arrives.
     while engines.len() < engine_count {
         debug!(
             handshake_address,
@@ -213,17 +217,20 @@ pub async fn connect_handshake(
                 }
                 debug!(handshake_address, ?engine_id, "received HELLO from engine");
 
-                send_init_message(
-                    &mut handshake_socket,
-                    &engine_id,
-                    &input_address,
-                    &output_address,
-                    coordinator.as_ref(),
-                )
-                .await?;
-                debug!(handshake_address, ?engine_id, "sent INIT to engine");
-
                 engines.insert(engine_id.clone(), EngineStartupState::HelloReceived);
+
+                if coordinator.is_none() {
+                    send_init_message(
+                        &mut handshake_socket,
+                        &engine_id,
+                        &input_address,
+                        &output_address,
+                        None,
+                        &empty_parallel_config,
+                    )
+                    .await?;
+                    debug!(handshake_address, ?engine_id, "sent INIT to engine");
+                }
             }
             Some("READY") => {
                 if coordinator.is_some() {
@@ -250,6 +257,28 @@ pub async fn connect_handshake(
             other => {
                 bail_unexpected_handshake_message!("unexpected handshake status {other:?}");
             }
+        }
+    }
+
+    // Probe bootstrap ports only after the complete coordinated cohort is waiting for INIT. The
+    // reservations are released immediately before Python must bind them.
+    if coordinator.is_some() {
+        let parallel_config = data_parallel_bootstrap(local_host, engine_count)?;
+        for engine_id in engines.keys() {
+            send_init_message(
+                &mut handshake_socket,
+                engine_id,
+                &input_address,
+                &output_address,
+                coordinator.as_ref(),
+                &parallel_config,
+            )
+            .await?;
+            debug!(
+                handshake_address,
+                ?engine_id,
+                "sent coordinated INIT to engine"
+            );
         }
     }
 
@@ -428,6 +457,7 @@ async fn send_init_message(
     input_address: &str,
     output_address: &str,
     coordinator: Option<&CoordinatorBootstrap>,
+    parallel_config: &BTreeMap<String, OpaqueValue>,
 ) -> Result<()> {
     let init_message = HandshakeInitMessage {
         addresses: HandshakeAddresses {
@@ -437,13 +467,56 @@ async fn send_init_message(
             coordinator_output: coordinator.map(|c| c.output_address.clone()),
             frontend_stats_publish_address: None,
         },
-        parallel_config: Default::default(),
+        parallel_config: parallel_config.clone(),
     };
     let payload = encode_msgpack(&init_message)?;
     let message = ZmqMessage::try_from(vec![engine_id.to_frame(), Bytes::from(payload)])
         .expect("handshake router messages must contain identity and payload");
     handshake_socket.send(message).await?;
     Ok(())
+}
+
+/// Build the Python-compatible bootstrap shared by a coordinated DP cohort.
+///
+/// TCP listeners reserve distinct ports while the map is assembled. They must
+/// be released before INIT is sent because Python owns the actual listeners,
+/// leaving an unavoidable probe-to-bind race after this function returns.
+fn data_parallel_bootstrap(
+    advertised_host: &str,
+    engine_count: usize,
+) -> Result<BTreeMap<String, OpaqueValue>> {
+    if engine_count <= 1 {
+        return Ok(BTreeMap::new());
+    }
+
+    let listeners = (0..DATA_PARALLEL_BOOTSTRAP_PORT_COUNT)
+        .map(|_| TcpListener::bind((advertised_host, 0)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut ports = listeners
+        .iter()
+        .map(|listener| listener.local_addr().map(|address| u64::from(address.port())))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let master_port = ports.pop().expect("bootstrap port count is nonzero");
+    drop(listeners);
+
+    Ok(BTreeMap::from([
+        (
+            "_data_parallel_master_port_list".to_string(),
+            OpaqueValue::Array(ports.into_iter().map(OpaqueValue::from).collect()),
+        ),
+        (
+            "data_parallel_master_ip".to_string(),
+            OpaqueValue::from(advertised_host),
+        ),
+        (
+            "data_parallel_master_port".to_string(),
+            OpaqueValue::from(master_port),
+        ),
+        (
+            "data_parallel_size".to_string(),
+            OpaqueValue::from(engine_count as u64),
+        ),
+    ]))
 }
 
 /// Receive the input registration message from each engine and validate its
