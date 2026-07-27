@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -120,10 +117,10 @@ fn request_output(
         stop_reason: None,
         events: None,
         kv_transfer_params: None,
-        ec_transfer_params: None,
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
+        ec_transfer_params: None,
         num_nans_in_logits: 0,
     }
 }
@@ -160,6 +157,10 @@ async fn send_outputs(push: &mut PushSocket, outputs: EngineCoreOutputs) {
 
 async fn recv_engine_message(dealer: &mut DealerSocket) -> Vec<bytes::Bytes> {
     dealer.recv().await.expect("recv engine message").into_vec()
+}
+
+fn test_llm(client: EngineCoreClient) -> Llm {
+    Llm::new(client).with_request_id_randomization(false)
 }
 
 #[derive(Clone, Debug)]
@@ -249,7 +250,7 @@ async fn setup_grpc_service(
     let engine_health = client.subscribe_health();
 
     let chat = ChatLlm::from_shared_backend(
-        Llm::new(client),
+        test_llm(client),
         Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
     );
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
