@@ -34,7 +34,6 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server as TonicServer;
@@ -78,30 +77,6 @@ async fn set_grpc_not_serving(health_reporter: &HealthReporter) {
     health_reporter
         .set_not_serving::<grpc::ControlServer<grpc::ControlServiceImpl>>()
         .await;
-}
-
-async fn wait_until_engine_unhealthy(mut engine_health: watch::Receiver<bool>) {
-    loop {
-        if !*engine_health.borrow_and_update() {
-            return;
-        }
-        if engine_health.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
-async fn monitor_grpc_health(
-    health_reporter: HealthReporter,
-    engine_health: watch::Receiver<bool>,
-    shutdown: CancellationToken,
-) {
-    tokio::select! {
-        _ = wait_until_engine_unhealthy(engine_health) => {}
-        _ = shutdown.cancelled() => {}
-    }
-
-    set_grpc_not_serving(&health_reporter).await;
 }
 
 async fn monitor_lora_health(
@@ -418,7 +393,7 @@ where
             };
             let lora_health =
                 monitor_lora_health(state, health_reporter.clone(), shutdown.child_token());
-            let engine_health = monitor_grpc_health(health_reporter, engine_health, shutdown);
+            let engine_health = grpc::monitor_health(health_reporter, engine_health, shutdown);
             tokio::join!(engine_health, lora_health);
         }
     };
