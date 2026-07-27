@@ -109,6 +109,7 @@ pub(super) fn prepare_completion_request(
         prompt: request.prompt,
         mm_features: None,
         sampling_params: SamplingParams {
+            routed_experts_prompt_start: 0,
             temperature: request.temperature,
             top_p: request.top_p,
             top_k: request.top_k,
@@ -217,6 +218,7 @@ mod tests {
         LoraModelResolution {
             model_names: names.iter().map(|s| s.to_string()).collect(),
             lora_request: None,
+            lease: None,
         }
     }
 

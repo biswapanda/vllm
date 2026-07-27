@@ -253,9 +253,15 @@ async fn setup_grpc_service(
         Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
     );
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
+    // Inference and control must share one AdmissionState so `Drain` on the
+    // control service stops the inference service admitting new work.
+    let admission = std::sync::Arc::new(super::AdmissionState::default());
     (
-        InferenceServer::new(InferenceServiceImpl::new(state.clone())),
-        ControlServer::new(ControlServiceImpl::new(state)),
+        InferenceServer::new(InferenceServiceImpl::with_admission(
+            state.clone(),
+            admission.clone(),
+        )),
+        ControlServer::new(ControlServiceImpl::with_admission(state, admission, None)),
         engine_health,
         engine_task,
     )
@@ -811,8 +817,8 @@ async fn unary_generate_with_sampling_params() {
             prompt: Some(pb::generate_request::Prompt::Text("test".to_string())),
             temperature: Some(0.7),
             sampling: Some(pb::RandomSampling {
-                top_k: 50,
-                top_p: 0.9,
+                top_k: Some(50),
+                top_p: Some(0.9),
                 seed: Some(42),
                 ..Default::default()
             }),

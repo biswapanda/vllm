@@ -4,16 +4,75 @@
 //! Conversion between gRPC protobuf types and internal `vllm-text`
 //! request/response types.
 
+mod multimodal;
+mod sampling;
+mod xargs;
+
+use multimodal::convert_mm_features;
+pub(crate) use multimodal::media_parts_from_request;
+#[cfg(test)]
+use multimodal::{mm_cache_identifier, preflight_msgpack};
+use sampling::build_sampling_params;
+use xargs::parse_vllm_xargs_json;
+
 use tonic::Status;
 use uuid::Uuid;
 use vllm_engine_core_client::protocol::output::StopReason;
-use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams;
+use vllm_engine_core_client::protocol::tensor::{WireArrayData, WireTensor};
 use vllm_text::{
-    DecodedLogprobs, DecodedPromptLogprobs, FinishReason, Finished, Prompt, SamplingParams,
-    TextDecodeOptions, TextRequest,
+    DecodedLogprobs, DecodedPromptLogprobs, FinishReason, Finished, Prompt, TextDecodeOptions,
+    TextRequest,
 };
 
 use super::pb;
+use super::struct_json::{json_to_prost_struct, prost_struct_to_json};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvRole {
+    Aggregated,
+    Prefill,
+    Decode,
+}
+
+pub fn role_from_kv_role(kv_role: Option<&str>) -> KvRole {
+    match kv_role {
+        Some("kv_producer") => KvRole::Prefill,
+        Some("kv_consumer") => KvRole::Decode,
+        _ => KvRole::Aggregated,
+    }
+}
+
+pub fn validate_disaggregated_request(
+    request: &pb::GenerateRequest,
+    role: KvRole,
+) -> Result<(), Status> {
+    let has_transfer_params = request
+        .kv
+        .as_ref()
+        .and_then(|kv| kv.kv_transfer_params.as_ref())
+        .is_some_and(|params| !params.fields.is_empty());
+    if role == KvRole::Decode && !has_transfer_params {
+        return Err(Status::invalid_argument(
+            "kv.kv_transfer_params is required for decode requests",
+        ));
+    }
+    Ok(())
+}
+
+pub fn mark_prefill_request(request: &mut TextRequest) {
+    let params = request
+        .sampling_params
+        .vllm_xargs
+        .get_or_insert_with(Default::default)
+        .entry("kv_transfer_params".to_string())
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if let Some(params) = params.as_object_mut() {
+        params.insert(
+            "do_remote_decode".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+}
 
 // ========================================================================================
 // Request conversion
@@ -42,11 +101,35 @@ pub fn to_text_request(
         ));
     }
 
+    if !req.media.is_empty() && !req.mm_features.is_empty() {
+        return Err(Status::invalid_argument(
+            "media and mm_features are mutually exclusive",
+        ));
+    }
+    if !req.lora_name.is_empty() && (!req.media.is_empty() || !req.mm_features.is_empty()) {
+        return Err(Status::invalid_argument(
+            "native gRPC does not yet advertise tower-LoRA multimodal cache semantics; multimodal requests with LoRA are unsupported",
+        ));
+    }
+
     let prompt = match req.prompt {
         Some(pb::generate_request::Prompt::Text(text)) => Prompt::Text(text),
         Some(pb::generate_request::Prompt::TokenIds(ids)) => Prompt::TokenIds(ids.ids),
         None => return Err(Status::invalid_argument("prompt is required")),
     };
+    match &prompt {
+        Prompt::TokenIds(ids) if req.routed_experts_prompt_start as usize >= ids.len() => {
+            return Err(Status::invalid_argument(
+                "routed_experts_prompt_start must be less than the prompt length",
+            ));
+        }
+        Prompt::Text(_) if req.routed_experts_prompt_start != 0 => {
+            return Err(Status::invalid_argument(
+                "nonzero routed_experts_prompt_start requires a token-ID prompt",
+            ));
+        }
+        _ => {}
+    }
 
     let request_id = if req.request_id.is_empty() {
         Uuid::new_v4().to_string()
@@ -62,20 +145,26 @@ pub fn to_text_request(
 
     let mut sampling_params =
         build_sampling_params(req.temperature, sampling, decoding, stopping, response)?;
+    sampling_params.routed_experts_prompt_start = req.routed_experts_prompt_start;
+
+    if let Some(raw) = req.vllm_xargs_json.as_deref() {
+        let xargs = parse_vllm_xargs_json(raw)?;
+        sampling_params.vllm_xargs = Some(xargs);
+    }
 
     // Thread KVCacheParameters → SamplingParams fields.
     if let Some(kv) = kv {
         // Thread kv_transfer_params through vllm_xargs, matching the HTTP route
         // convention.
         if let Some(kv_struct) = kv.kv_transfer_params.as_ref() {
-            let kv_json = proto_struct_to_json(kv_struct);
+            let kv_json = prost_struct_to_json(kv_struct);
             let map = sampling_params.vllm_xargs.get_or_insert_with(Default::default);
+            if map.contains_key("kv_transfer_params") {
+                return Err(Status::invalid_argument(
+                    "kv_transfer_params cannot be supplied in both vllm_xargs_json and kv",
+                ));
+            }
             map.insert("kv_transfer_params".to_string(), kv_json);
-        }
-        if let Some(ec_struct) = kv.ec_transfer_params.as_ref() {
-            let ec_json = proto_struct_to_json(ec_struct);
-            let map = sampling_params.vllm_xargs.get_or_insert_with(Default::default);
-            map.insert("ec_transfer_params".to_string(), ec_json);
         }
         if kv.bypass_prefix_cache {
             sampling_params.skip_reading_prefix_cache = Some(true);
@@ -89,10 +178,12 @@ pub fn to_text_request(
         min_tokens: stopping.map_or(0, |s| s.min_new_tokens),
     };
 
+    let mm_features = convert_mm_features(&req.mm_features, &prompt)?;
+
     Ok(TextRequest {
         request_id,
         prompt,
-        mm_features: None,
+        mm_features,
         sampling_params,
         decode_options,
         intermediate: stream,
@@ -104,156 +195,6 @@ pub fn to_text_request(
         lora_request: None,
         arrival_time: None,
     })
-}
-
-fn build_sampling_params(
-    temperature: Option<f32>,
-    sampling: Option<&pb::RandomSampling>,
-    decoding: Option<&pb::DecodingParameters>,
-    stopping: Option<&pb::StoppingCriteria>,
-    response: Option<&pb::ResponseOptions>,
-) -> Result<SamplingParams, Status> {
-    // Temperature is a top-level GenerateRequest field. Default to greedy (0.0) for
-    // the gRPC API when the caller does not specify a value. This differs from
-    // the HTTP/OpenAI API (which defaults to 1.0) and matches the convention of
-    // programmatic generation APIs.
-    let temperature = temperature.or(Some(0.0));
-    let mut params = SamplingParams {
-        temperature,
-        ..SamplingParams::default()
-    };
-
-    // RandomSampling: for every remaining sampling field the protobuf default (`0`)
-    // is treated as "unset" and leaves the resolved value to the lowering
-    // stage, which falls back to the model-provided default or a
-    // neutral/disabled value otherwise.
-    if let Some(s) = sampling {
-        // num_sequences (n > 1) is not supported yet by the TextLlm layer; the response
-        // path also hardcodes SequenceOutput.index = 0, so accepting >1 would silently
-        // truncate output cardinality. Reject explicitly.
-        if s.num_sequences > 1 {
-            return Err(Status::invalid_argument(
-                "num_sequences > 1 is not supported",
-            ));
-        }
-        if s.top_k != 0 {
-            params.top_k = Some(s.top_k);
-        }
-        if s.top_p != 0.0 {
-            params.top_p = Some(s.top_p);
-        }
-        if s.min_p != 0.0 {
-            params.min_p = Some(s.min_p);
-        }
-        params.seed = s.seed;
-    }
-
-    // DecodingParameters
-    if let Some(d) = decoding {
-        if d.presence_penalty != 0.0 {
-            params.presence_penalty = Some(d.presence_penalty);
-        }
-        if d.frequency_penalty != 0.0 {
-            params.frequency_penalty = Some(d.frequency_penalty);
-        }
-        if d.repetition_penalty != 0.0 {
-            params.repetition_penalty = Some(d.repetition_penalty);
-        }
-        if !d.logit_bias.is_empty() {
-            params.logit_bias = Some(d.logit_bias.clone());
-        }
-        if !d.allowed_token_ids.is_empty() {
-            params.allowed_token_ids = Some(d.allowed_token_ids.clone());
-        }
-        params.structured_outputs = convert_structured_output(d)?;
-    }
-
-    // StoppingCriteria
-    if let Some(s) = stopping {
-        if s.max_new_tokens != 0 {
-            params.max_tokens = Some(s.max_new_tokens);
-        }
-        if s.min_new_tokens != 0 {
-            params.min_tokens = Some(s.min_new_tokens);
-        }
-        if !s.stop_token_ids.is_empty() {
-            params.stop_token_ids = Some(s.stop_token_ids.clone());
-        }
-        params.ignore_eos = s.ignore_eos;
-    }
-
-    // ResponseOptions → logprobs
-    if let Some(r) = response {
-        if r.output_logprobs {
-            let (count, token_ids) = candidate_logprob_spec(r.output_candidates.as_ref());
-            params.logprobs = Some(count);
-            params.logprob_token_ids = token_ids;
-        }
-        if r.prompt_logprobs {
-            // The engine-core protocol has only one shared `logprob_token_ids` field
-            // for output and prompt logprobs, so a per-token-id selector for prompt
-            // candidates can't be honored independently. Reject it instead of silently
-            // dropping the list.
-            if matches!(
-                r.prompt_candidates.as_ref().and_then(|c| c.select.as_ref()),
-                Some(pb::candidate_tokens::Select::TokenIds(_))
-            ) {
-                return Err(Status::invalid_argument(
-                    "prompt_candidates token_ids selector is not supported",
-                ));
-            }
-            let (count, _) = candidate_logprob_spec(r.prompt_candidates.as_ref());
-            params.prompt_logprobs = Some(count);
-        }
-    }
-
-    Ok(params)
-}
-
-/// Map the proto `CandidateTokens` selector to a `(logprobs_count,
-/// logprob_token_ids)` pair.
-///
-/// - `top_n(k)` → `(k, None)` — return top-k candidates by probability
-/// - `all` → `(-1, None)` — return the full vocabulary
-/// - `token_ids(n)` → `(1, Some(vec of n token ids))` — return logprobs for specific tokens (the
-///   count `n` is stored in the proto as the number of token IDs that follow, but the actual IDs
-///   are carried via `logprob_token_ids` on `SamplingParams`)
-/// - absent → `(1, None)` — just the sampled/scored token
-fn candidate_logprob_spec(candidates: Option<&pb::CandidateTokens>) -> (i32, Option<Vec<u32>>) {
-    match candidates.and_then(|c| c.select.as_ref()) {
-        Some(pb::candidate_tokens::Select::TopN(n)) => (*n as i32, None),
-        Some(pb::candidate_tokens::Select::All(true)) => (-1, None),
-        Some(pb::candidate_tokens::Select::TokenIds(ids)) => (1, Some(ids.ids.clone())),
-        _ => (1, None),
-    }
-}
-
-fn convert_structured_output(
-    d: &pb::DecodingParameters,
-) -> Result<Option<StructuredOutputsParams>, Status> {
-    let so = match d.structured_output.as_ref() {
-        None => return Ok(None),
-        Some(so) => so,
-    };
-    use pb::decoding_parameters::StructuredOutput;
-    let params = match so {
-        StructuredOutput::Json(schema) => {
-            let json: serde_json::Value = serde_json::from_str(schema)
-                .map_err(|e| Status::invalid_argument(format!("invalid json schema: {e}")))?;
-            StructuredOutputsParams::json(json)
-        }
-        StructuredOutput::Regex(regex) => StructuredOutputsParams::regex(regex.clone()),
-        StructuredOutput::Choice(choices) => {
-            StructuredOutputsParams::choice(choices.choices.clone())
-        }
-        StructuredOutput::Grammar(grammar) => StructuredOutputsParams::grammar(grammar.clone()),
-        StructuredOutput::JsonObject(true) => StructuredOutputsParams::json_object(),
-        StructuredOutput::JsonObject(false) => return Ok(None),
-        StructuredOutput::StructuralTag(tag) => {
-            StructuredOutputsParams::structural_tag(tag.clone())
-        }
-    };
-    Ok(Some(params))
 }
 
 // ========================================================================================
@@ -317,6 +258,22 @@ pub fn to_sequence_output(
         ranks: rank_values,
         candidate_tokens: candidates,
         finish_info: finished.map(|f| to_finish_info(f, token_ids)),
+        routed_experts: finished
+            .and_then(|finished| finished.routed_experts.as_ref().map(routed_experts_to_proto)),
+    }
+}
+
+fn routed_experts_to_proto(tensor: &WireTensor) -> pb::RoutedExpertsTensor {
+    let data = match &tensor.data {
+        WireArrayData::RawView(data) => data.clone(),
+        WireArrayData::AuxIndex(_) => {
+            unreachable!("engine-core output arrays are resolved before response conversion")
+        }
+    };
+    pb::RoutedExpertsTensor {
+        dtype: tensor.dtype.clone(),
+        shape: tensor.shape.iter().map(|&dim| dim as u64).collect(),
+        data,
     }
 }
 
@@ -350,8 +307,7 @@ fn to_finish_info(finished: &Finished, token_ids: &[u32]) -> pb::FinishInfo {
         num_output_tokens: finished.usage.output_token_count as u32,
         finish_reason,
         stop_reason,
-        kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_proto_struct),
-        ec_transfer_params: finished.ec_transfer_params.as_ref().and_then(json_to_proto_struct),
+        kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_prost_struct),
     }
 }
 
@@ -397,72 +353,30 @@ fn positions_to_proto(
         if let Some(first) = pos.entries.first() {
             logprobs.push(first.logprob);
             ranks.push(first.rank);
-        }
 
-        // Extra candidates beyond the first.
-        let entries = pos.entries.iter().skip(1);
-        candidates.push(pb::CandidateTokenInfo {
-            tokens: entries
-                .map(|e| pb::candidate_token_info::TokenInfo {
-                    id: e.token_id,
-                    logprob: e.logprob,
-                    rank: e.rank,
-                })
-                .collect(),
-        });
+            // Engine-core can include the sampled token again in its top-k
+            // alternatives. The gRPC schema carries that token separately in
+            // the parallel token_ids/logprobs/ranks fields, so do not repeat it
+            // in CandidateTokenInfo (whose contract is alternatives only).
+            candidates.push(pb::CandidateTokenInfo {
+                tokens: pos
+                    .entries
+                    .iter()
+                    .skip(1)
+                    .filter(|entry| entry.token_id != first.token_id)
+                    .map(|entry| pb::candidate_token_info::TokenInfo {
+                        id: entry.token_id,
+                        logprob: entry.logprob,
+                        rank: entry.rank,
+                    })
+                    .collect(),
+            });
+        } else {
+            candidates.push(pb::CandidateTokenInfo { tokens: vec![] });
+        }
     }
 
     (logprobs, ranks, candidates)
-}
-
-// ========================================================================================
-// KV transfer params conversion (serde_json::Value ↔ prost_types::Struct)
-// ========================================================================================
-
-fn proto_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
-    serde_json::Value::Object(
-        s.fields.iter().map(|(k, v)| (k.clone(), proto_value_to_json(v))).collect(),
-    )
-}
-
-fn proto_value_to_json(v: &prost_types::Value) -> serde_json::Value {
-    use prost_types::value::Kind;
-    match v.kind.as_ref() {
-        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
-        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(Kind::NumberValue(n)) => serde_json::json!(*n),
-        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(Kind::ListValue(list)) => {
-            serde_json::Value::Array(list.values.iter().map(proto_value_to_json).collect())
-        }
-        Some(Kind::StructValue(s)) => proto_struct_to_json(s),
-    }
-}
-
-fn json_to_proto_struct(value: &serde_json::Value) -> Option<prost_types::Struct> {
-    match value {
-        serde_json::Value::Object(map) => Some(prost_types::Struct {
-            fields: map.iter().map(|(k, v)| (k.clone(), json_to_proto_value(v))).collect(),
-        }),
-        _ => None,
-    }
-}
-
-fn json_to_proto_value(v: &serde_json::Value) -> prost_types::Value {
-    use prost_types::value::Kind;
-    let kind = match v {
-        serde_json::Value::Null => Kind::NullValue(0),
-        serde_json::Value::Bool(b) => Kind::BoolValue(*b),
-        serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap_or(0.0)),
-        serde_json::Value::String(s) => Kind::StringValue(s.clone()),
-        serde_json::Value::Array(arr) => Kind::ListValue(prost_types::ListValue {
-            values: arr.iter().map(json_to_proto_value).collect(),
-        }),
-        serde_json::Value::Object(map) => Kind::StructValue(prost_types::Struct {
-            fields: map.iter().map(|(k, v)| (k.clone(), json_to_proto_value(v))).collect(),
-        }),
-    };
-    prost_types::Value { kind: Some(kind) }
 }
 
 // ========================================================================================
@@ -499,11 +413,25 @@ impl ResponseOpts {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use vllm_engine_core_client::protocol::multimodal::{
+        MmBatchedField, MmField, MmFieldElem, MmKwargValue,
+    };
     use vllm_engine_core_client::protocol::output::StopReason;
-    use vllm_text::{FinishReason, Finished, Prompt};
+    use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputConstraint;
+    use vllm_engine_core_client::protocol::tensor::WireTensor;
+    use vllm_text::{
+        DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob, FinishReason, Finished,
+        Prompt,
+    };
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
-    use super::{ResponseOpts, pb, to_finish_info, to_sequence_output, to_text_request};
+    use super::{
+        KvRole, ResponseOpts, mark_prefill_request, media_parts_from_request, mm_cache_identifier,
+        pb, preflight_msgpack, to_finish_info, to_sequence_output, to_text_request,
+        validate_disaggregated_request,
+    };
 
     fn base_request() -> pb::GenerateRequest {
         pb::GenerateRequest {
@@ -512,6 +440,45 @@ mod tests {
             prompt: Some(pb::generate_request::Prompt::Text("hi".to_string())),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn media_requires_a_source() {
+        let error = media_parts_from_request(&[pb::MediaItem {
+            modality: pb::Modality::Image as i32,
+            ..Default::default()
+        }])
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn media_rejects_unsupported_modalities() {
+        let error = media_parts_from_request(&[pb::MediaItem {
+            modality: pb::Modality::Audio as i32,
+            source: Some(pb::media_item::Source::Url(
+                "https://example.test/a.wav".into(),
+            )),
+            ..Default::default()
+        }])
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+    }
+
+    #[test]
+    fn decode_requires_kv_transfer_params() {
+        let error = validate_disaggregated_request(&base_request(), KvRole::Decode).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn prefill_marks_remote_decode() {
+        let mut text = to_text_request(base_request(), false, &["test-model".to_string()]).unwrap();
+        mark_prefill_request(&mut text);
+        assert_eq!(
+            text.sampling_params.vllm_xargs.as_ref().unwrap()["kv_transfer_params"]["do_remote_decode"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]
@@ -543,6 +510,39 @@ mod tests {
         };
         let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
         assert_eq!(text.sampling_params.seed, None);
+    }
+
+    #[test]
+    fn routed_experts_prompt_start_reaches_text_sampling_params() {
+        let req = pb::GenerateRequest {
+            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: vec![1, 2],
+            })),
+            routed_experts_prompt_start: 1,
+            ..base_request()
+        };
+
+        let text = to_text_request(req, false, &["test-model".to_string()]).unwrap();
+
+        assert_eq!(text.sampling_params.routed_experts_prompt_start, 1);
+    }
+
+    #[test]
+    fn routed_experts_prompt_start_rejects_unverifiable_or_out_of_range_values() {
+        let text_prompt = pb::GenerateRequest {
+            routed_experts_prompt_start: 1,
+            ..base_request()
+        };
+        assert!(to_text_request(text_prompt, false, &["test-model".to_string()]).is_err());
+
+        let token_prompt = pb::GenerateRequest {
+            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: vec![1, 2],
+            })),
+            routed_experts_prompt_start: 2,
+            ..base_request()
+        };
+        assert!(to_text_request(token_prompt, false, &["test-model".to_string()]).is_err());
     }
 
     #[test]
@@ -586,6 +586,293 @@ mod tests {
         assert!(matches!(text.prompt, Prompt::Text(s) if s == "hi"));
     }
 
+    #[test]
+    fn extended_sampling_fields_reach_text_request_losslessly() {
+        let req = pb::GenerateRequest {
+            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: vec![1, 2, 3],
+            })),
+            sampling: Some(pb::RandomSampling {
+                top_k: Some(-1),
+                top_p: Some(0.0),
+                min_p: Some(0.0),
+                ..Default::default()
+            }),
+            decoding: Some(pb::DecodingParameters {
+                presence_penalty: Some(0.0),
+                frequency_penalty: Some(0.0),
+                repetition_penalty: Some(0.0),
+                logit_bias: [(7, -1.25)].into_iter().collect(),
+                allowed_token_ids: vec![7, 8],
+                bad_words: vec!["blocked".to_string()],
+                structured_output: Some(pb::decoding_parameters::StructuredOutput::Regex(
+                    "[a-z]+".to_string(),
+                )),
+                structured_output_disable_any_whitespace: true,
+                structured_output_disable_additional_properties: true,
+                structured_output_whitespace_pattern: Some("\\s*".to_string()),
+            }),
+            stopping: Some(pb::StoppingCriteria {
+                thinking_token_budget: Some(64),
+                ..Default::default()
+            }),
+            response: Some(pb::ResponseOptions {
+                output_logprobs: true,
+                output_candidates: Some(pb::CandidateTokens {
+                    select: Some(pb::candidate_tokens::Select::TokenIds(pb::TokenIds {
+                        ids: vec![7, 8],
+                    })),
+                }),
+                ..Default::default()
+            }),
+            vllm_xargs_json: Some(br#"{"custom_integer":9007199254740993}"#.to_vec()),
+            ..base_request()
+        };
+
+        let text = to_text_request(req, false, &["test-model".to_string()]).unwrap();
+
+        assert_eq!(text.sampling_params.top_k, Some(0));
+        assert_eq!(text.sampling_params.top_p, Some(0.0));
+        assert_eq!(text.sampling_params.min_p, Some(0.0));
+        assert_eq!(text.sampling_params.presence_penalty, Some(0.0));
+        assert_eq!(text.sampling_params.frequency_penalty, Some(0.0));
+        assert_eq!(text.sampling_params.repetition_penalty, Some(0.0));
+        assert_eq!(text.sampling_params.thinking_token_budget, Some(64));
+        assert_eq!(text.sampling_params.logit_bias.as_ref().unwrap()[&7], -1.25);
+        assert_eq!(text.sampling_params.allowed_token_ids, Some(vec![7, 8]));
+        assert_eq!(
+            text.sampling_params.bad_words,
+            Some(vec!["blocked".to_string()])
+        );
+        assert_eq!(text.sampling_params.logprobs, Some(2));
+        assert_eq!(text.sampling_params.logprob_token_ids, Some(vec![7, 8]));
+        let structured = text.sampling_params.structured_outputs.unwrap();
+        assert_eq!(
+            structured.constraint,
+            StructuredOutputConstraint::Regex("[a-z]+".to_string())
+        );
+        assert!(structured.options.disable_any_whitespace);
+        assert!(structured.options.disable_additional_properties);
+        assert_eq!(
+            structured.options.whitespace_pattern.as_deref(),
+            Some("\\s*")
+        );
+        assert_eq!(
+            text.sampling_params.vllm_xargs.as_ref().unwrap()["custom_integer"],
+            serde_json::json!(9_007_199_254_740_993_u64)
+        );
+    }
+
+    #[test]
+    fn preprocessed_multimodal_features_reach_text_request() {
+        let kwargs = BTreeMap::from([(
+            "num_tiles".to_string(),
+            MmFieldElem {
+                data: Some(MmKwargValue::Int(2)),
+                field: MmField::Batched(MmBatchedField { keep_on_cpu: true }),
+            },
+        )]);
+        let kwargs_msgpack = rmp_serde::to_vec_named(&kwargs).unwrap();
+        let identifier = mm_cache_identifier("image", &kwargs_msgpack);
+        let req = pb::GenerateRequest {
+            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: vec![10, 99, 99, 20],
+            })),
+            mm_features: vec![pb::PreprocessedMultimodalFeature {
+                modality: "image".to_string(),
+                mm_hash: identifier.clone(),
+                position: Some(pb::MultimodalPlaceholder {
+                    offset: 1,
+                    length: 2,
+                    is_embed: vec![true, false],
+                }),
+                cache_identifier: identifier.clone(),
+                kwargs_msgpack: Some(kwargs_msgpack),
+            }],
+            ..base_request()
+        };
+
+        let text = to_text_request(req, false, &["test-model".to_string()]).unwrap();
+        let features = text.mm_features.unwrap();
+
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].modality, "image");
+        assert!(features[0].identifier.starts_with("grpc-mm:"));
+        assert_eq!(features[0].mm_hash.as_deref(), Some(identifier.as_str()));
+        assert_eq!(features[0].data.as_ref(), Some(&kwargs));
+        assert_eq!(features[0].mm_position.offset, 1);
+        assert_eq!(features[0].mm_position.length, 2);
+        assert!(features[0].mm_position.is_embed.is_some());
+    }
+
+    #[test]
+    fn multimodal_lora_is_rejected_until_tower_cache_semantics_are_advertised() {
+        for request in [
+            pb::GenerateRequest {
+                lora_name: "adapter-a".to_string(),
+                media: vec![pb::MediaItem::default()],
+                ..base_request()
+            },
+            pb::GenerateRequest {
+                lora_name: "adapter-a".to_string(),
+                mm_features: vec![pb::PreprocessedMultimodalFeature::default()],
+                ..base_request()
+            },
+        ] {
+            let error = to_text_request(request, false, &["test-model".to_string()]).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("tower-LoRA"));
+        }
+    }
+
+    #[test]
+    fn preprocessed_multimodal_cache_hit_without_data_is_rejected() {
+        let req = pb::GenerateRequest {
+            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: vec![10, 99, 20],
+            })),
+            mm_features: vec![pb::PreprocessedMultimodalFeature {
+                modality: "image".to_string(),
+                mm_hash: "image-hash".to_string(),
+                position: Some(pb::MultimodalPlaceholder {
+                    offset: 1,
+                    length: 1,
+                    is_embed: Vec::new(),
+                }),
+                kwargs_msgpack: None,
+                cache_identifier: String::new(),
+            }],
+            ..base_request()
+        };
+
+        let error = to_text_request(req, false, &["test-model".to_string()]).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn multimodal_cache_identity_is_data_bound_without_language_lora_scoping() {
+        fn request(value: i64) -> pb::GenerateRequest {
+            let kwargs = BTreeMap::from([(
+                "value".to_string(),
+                MmFieldElem {
+                    data: Some(MmKwargValue::Int(value)),
+                    field: MmField::Batched(MmBatchedField { keep_on_cpu: true }),
+                },
+            )]);
+            let kwargs_msgpack = rmp_serde::to_vec_named(&kwargs).unwrap();
+            let identifier = mm_cache_identifier("image", &kwargs_msgpack);
+            pb::GenerateRequest {
+                prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                    ids: vec![10, 99, 20],
+                })),
+                mm_features: vec![pb::PreprocessedMultimodalFeature {
+                    modality: "image".to_string(),
+                    mm_hash: identifier.clone(),
+                    position: Some(pb::MultimodalPlaceholder {
+                        offset: 1,
+                        length: 1,
+                        is_embed: Vec::new(),
+                    }),
+                    cache_identifier: identifier,
+                    kwargs_msgpack: Some(kwargs_msgpack),
+                }],
+                ..base_request()
+            }
+        }
+
+        let first = to_text_request(request(1), false, &["test-model".to_string()]).unwrap();
+        let second = to_text_request(request(2), false, &["test-model".to_string()]).unwrap();
+        assert_ne!(
+            first.mm_features.as_ref().unwrap()[0].identifier,
+            second.mm_features.as_ref().unwrap()[0].identifier
+        );
+        assert!(first.mm_features.as_ref().unwrap()[0].identifier.starts_with("grpc-mm:"));
+    }
+
+    #[test]
+    fn multimodal_cache_identity_has_a_cross_language_fixed_vector() {
+        assert_eq!(
+            mm_cache_identifier("image", b"abc"),
+            "grpc-mm:c2f2df4bb94911d850921fa6d577ee0713ad5884c276f85330a8e50137f6a59d"
+        );
+    }
+
+    #[test]
+    fn multimodal_cache_identity_mismatch_is_rejected() {
+        let kwargs = BTreeMap::from([(
+            "value".to_string(),
+            MmFieldElem {
+                data: Some(MmKwargValue::Int(1)),
+                field: MmField::Batched(MmBatchedField { keep_on_cpu: true }),
+            },
+        )]);
+        let kwargs_msgpack = rmp_serde::to_vec_named(&kwargs).unwrap();
+        let req = pb::GenerateRequest {
+            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: vec![10, 99, 20],
+            })),
+            mm_features: vec![pb::PreprocessedMultimodalFeature {
+                modality: "image".to_string(),
+                mm_hash: "image-hash".to_string(),
+                position: Some(pb::MultimodalPlaceholder {
+                    offset: 1,
+                    length: 1,
+                    is_embed: Vec::new(),
+                }),
+                kwargs_msgpack: Some(kwargs_msgpack.clone()),
+                cache_identifier: mm_cache_identifier("image", &kwargs_msgpack),
+            }],
+            ..base_request()
+        };
+
+        let error = to_text_request(req, false, &["test-model".to_string()]).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn vllm_xargs_reject_reserved_kv_control() {
+        let req = pb::GenerateRequest {
+            vllm_xargs_json: Some(br#"{"kv_transfer_params":{}}"#.to_vec()),
+            ..base_request()
+        };
+        let error = to_text_request(req, false, &["test-model".to_string()]).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn msgpack_preflight_rejects_trailing_and_amplified_values() {
+        let mut nodes = 0;
+        assert!(preflight_msgpack(&[0xc0, 0xc0], &mut nodes).is_err());
+
+        let mut nodes = 0;
+        let oversized_array = [0xdd, 0x00, 0x01, 0x00, 0x01];
+        assert!(preflight_msgpack(&oversized_array, &mut nodes).is_err());
+    }
+
+    #[test]
+    fn malformed_preprocessed_multimodal_feature_is_rejected() {
+        let req = pb::GenerateRequest {
+            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: vec![1, 2],
+            })),
+            mm_features: vec![pb::PreprocessedMultimodalFeature {
+                modality: "image".to_string(),
+                mm_hash: "image-hash".to_string(),
+                position: Some(pb::MultimodalPlaceholder {
+                    offset: 1,
+                    length: 2,
+                    is_embed: Vec::new(),
+                }),
+                kwargs_msgpack: Some(vec![0xc1]),
+                cache_identifier: "invalid".to_string(),
+            }],
+            ..base_request()
+        };
+
+        let error = to_text_request(req, false, &["test-model".to_string()]).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
     fn finished(reason: FinishReason) -> Finished {
         Finished {
             usage: vllm_llm::TokenUsage {
@@ -596,6 +883,7 @@ mod tests {
             finish_reason: reason,
             kv_transfer_params: None,
             ec_transfer_params: None,
+            routed_experts: None,
         }
     }
 
@@ -678,5 +966,64 @@ mod tests {
         let finish = out.finish_info.expect("finish_info should be present");
         assert_eq!(finish.finish_reason, PbFinishReason::Stop as i32);
         assert_eq!(finish.stop_reason, Some(PbStopReason::EosTokenId(30)));
+    }
+
+    #[test]
+    fn to_sequence_output_emits_typed_routed_experts() {
+        let mut fin = finished(FinishReason::Length);
+        fin.routed_experts = Some(WireTensor::from_raw("|u1", vec![1, 2, 2], vec![1, 2, 3, 4]));
+
+        let output = to_sequence_output("", &[], None, Some(&fin), &ResponseOpts::default());
+        let routed = output.routed_experts.unwrap();
+        assert_eq!(routed.dtype, "|u1");
+        assert_eq!(routed.shape, vec![1, 2, 2]);
+        assert_eq!(routed.data, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn output_logprobs_do_not_repeat_the_sampled_token_as_a_candidate() {
+        let logprobs = DecodedLogprobs {
+            positions: vec![DecodedPositionLogprobs {
+                entries: vec![
+                    DecodedTokenLogprob {
+                        token_id: 42,
+                        token: "sampled".into(),
+                        logprob: -0.1,
+                        rank: 1,
+                    },
+                    DecodedTokenLogprob {
+                        token_id: 42,
+                        token: "sampled".into(),
+                        logprob: -0.1,
+                        rank: 1,
+                    },
+                    DecodedTokenLogprob {
+                        token_id: 7,
+                        token: "alternate".into(),
+                        logprob: -1.2,
+                        rank: 2,
+                    },
+                ],
+            }],
+        };
+        let opts = ResponseOpts {
+            output_token_ids: true,
+            output_logprobs: true,
+            ..Default::default()
+        };
+
+        let output = to_sequence_output("sampled", &[42], Some(&logprobs), None, &opts);
+
+        assert_eq!(output.logprobs, vec![-0.1]);
+        assert_eq!(output.ranks, vec![1]);
+        assert_eq!(output.candidate_tokens.len(), 1);
+        assert_eq!(
+            output.candidate_tokens[0]
+                .tokens
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
     }
 }

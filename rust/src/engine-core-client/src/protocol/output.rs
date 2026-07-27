@@ -13,6 +13,7 @@ use super::utility::UtilityOutput;
 use crate::error::{Error, Result, ext_value_decode};
 use crate::protocol::logprobs::MaybeWireLogprobs;
 use crate::protocol::stats::{PrefillStats, SchedulerStats};
+use crate::protocol::tensor::{ShapeExt, WireArrayData, WireNdArray};
 use crate::protocol::{OpaqueValue, decode_msgpack};
 
 /// The stop reason associated with a finished output.
@@ -108,7 +109,7 @@ pub struct EngineCoreOutput {
     #[serde(default)]
     pub prefill_stats: Option<PrefillStats>,
     #[serde(default)]
-    pub routed_experts: Option<OpaqueValue>,
+    pub routed_experts: Option<WireNdArray>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     #[serde(default)]
     pub num_nans_in_logits: u32,
@@ -132,8 +133,109 @@ impl EngineCoreOutput {
         self.new_prompt_logprobs_tensors = (self.new_prompt_logprobs_tensors.take())
             .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
             .transpose()?;
+        self.routed_experts = (self.routed_experts.take())
+            .map(|value| resolve_routed_experts(value, frames))
+            .transpose()?;
         Ok(())
     }
+}
+
+fn resolve_routed_experts<Frame>(value: WireNdArray, frames: &[Frame]) -> Result<WireNdArray>
+where
+    Frame: AsRef<[u8]>,
+{
+    let WireNdArray { dtype, shape, data } = value;
+    if shape.len() != 3 {
+        return Err(Error::Decode {
+            target_type: "EngineCoreOutput.routed_experts",
+            message: format!("expected rank 3, got shape {shape:?}"),
+        });
+    }
+    let element_width = match dtype.as_str() {
+        "uint8" | "|u1" => 1,
+        "uint16" | "<u2" | ">u2" | "=u2" => 2,
+        _ => {
+            return Err(Error::Decode {
+                target_type: "EngineCoreOutput.routed_experts",
+                message: format!("expected uint8 or uint16 dtype, got {dtype:?}"),
+            });
+        }
+    };
+    let bytes = match data {
+        WireArrayData::RawView(bytes) => bytes,
+        WireArrayData::AuxIndex(index) => frames
+            .get(index)
+            .ok_or_else(|| Error::Decode {
+                target_type: "EngineCoreOutput.routed_experts",
+                message: format!(
+                    "aux frame index {index} out of range for {} frames",
+                    frames.len()
+                ),
+            })?
+            .as_ref()
+            .to_vec(),
+    };
+    let expected = shape
+        .checked_numel()
+        .and_then(|elements| elements.checked_mul(element_width))
+        .ok_or_else(|| Error::Decode {
+        target_type: "EngineCoreOutput.routed_experts",
+        message: "shape byte length overflows usize".to_string(),
+    })?;
+    if bytes.len() != expected {
+        return Err(Error::Decode {
+            target_type: "EngineCoreOutput.routed_experts",
+            message: format!(
+                "byte length mismatch: expected {expected}, got {}",
+                bytes.len()
+            ),
+        });
+    }
+    Ok(WireNdArray {
+        dtype,
+        shape,
+        data: WireArrayData::RawView(bytes),
+    })
+}
+
+/// Concatenate resolved routed-expert chunks along their token axis.
+pub fn concatenate_routed_experts(
+    chunks: impl IntoIterator<Item = WireNdArray>,
+) -> Result<Option<WireNdArray>> {
+    let mut chunks = chunks.into_iter();
+    let Some(mut combined) = chunks.next() else {
+        return Ok(None);
+    };
+    let WireArrayData::RawView(combined_data) = &mut combined.data else {
+        return Err(Error::Decode {
+            target_type: "EngineCoreOutput.routed_experts",
+            message: "unresolved auxiliary payload".to_string(),
+        });
+    };
+    for chunk in chunks {
+        if chunk.dtype != combined.dtype
+            || chunk.shape.len() != combined.shape.len()
+            || chunk.shape[1..] != combined.shape[1..]
+        {
+            return Err(Error::Decode {
+                target_type: "EngineCoreOutput.routed_experts",
+                message: "incompatible routed-expert chunk dtype or shape".to_string(),
+            });
+        }
+        combined.shape[0] =
+            combined.shape[0].checked_add(chunk.shape[0]).ok_or_else(|| Error::Decode {
+                target_type: "EngineCoreOutput.routed_experts",
+                message: "concatenated token dimension overflows usize".to_string(),
+            })?;
+        let WireArrayData::RawView(data) = chunk.data else {
+            return Err(Error::Decode {
+                target_type: "EngineCoreOutput.routed_experts",
+                message: "unresolved auxiliary payload".to_string(),
+            });
+        };
+        combined_data.extend(data);
+    }
+    Ok(Some(combined))
 }
 
 /// Raw Python/msgpack engine-core output envelope.
@@ -401,6 +503,45 @@ mod tests {
             decoded.finished_requests,
             Some(BTreeSet::from(["req-1".to_string()]))
         );
+    }
+
+    #[test]
+    fn routed_experts_resolve_from_aux_frame() {
+        let outputs = WireEngineCoreOutputs {
+            outputs: vec![EngineCoreOutput {
+                request_id: "req-routed".to_string(),
+                new_token_ids: vec![42],
+                routed_experts: Some(WireNdArray {
+                    dtype: "|u1".to_string(),
+                    shape: vec![1, 2, 2],
+                    data: WireArrayData::AuxIndex(1),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let primary = encode_msgpack(&outputs).unwrap();
+        let frames = vec![primary, vec![1, 2, 3, 4]];
+
+        let decoded = decode_engine_core_outputs(&frames).unwrap();
+        let routed =
+            decoded.as_request_batch().unwrap().outputs[0].routed_experts.as_ref().unwrap();
+        assert_eq!(routed.dtype, "|u1");
+        assert_eq!(routed.shape, vec![1, 2, 2]);
+        assert_eq!(routed.data.as_raw_view().unwrap(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn routed_experts_chunks_concatenate_on_token_axis() {
+        let combined = concatenate_routed_experts([
+            WireNdArray::from_raw("|u1", vec![1, 2, 1], vec![1, 2]),
+            WireNdArray::from_raw("|u1", vec![2, 2, 1], vec![3, 4, 5, 6]),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(combined.shape, vec![3, 2, 1]);
+        assert_eq!(combined.data.as_raw_view().unwrap(), &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

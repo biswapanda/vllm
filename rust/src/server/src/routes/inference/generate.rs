@@ -46,7 +46,13 @@ pub async fn generate(
     ValidatedJson(body): ValidatedJson<GenerateRequest>,
 ) -> Response {
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
-    let lora_resolution = state.resolve_model_with_loras(body.model.as_deref()).await;
+    let mut lora_resolution = state.resolve_model_with_loras(body.model.as_deref()).await;
+    if lora_resolution.lora_request.is_some() && !state.lora_state_is_consistent() {
+        return ApiError::server_error(
+            "LoRA state differs across engine ranks; restart the engine".to_string(),
+        )
+        .into_response();
+    }
     let prepared = match prepare_generate_request(body, &lora_resolution, request_context) {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
@@ -72,6 +78,8 @@ pub async fn generate(
                 .into_response();
         }
     };
+
+    let raw_stream = crate::lora::hold_lora_lease(raw_stream, lora_resolution.lease.take());
 
     if stream {
         let chunk_stream = generate_chunk_stream(
@@ -406,6 +414,7 @@ mod tests {
     async fn generate_chunk_stream_captures_late_prompt_info() {
         let stream = stream::iter(vec![
             Ok(GenerateOutput {
+                routed_experts: None,
                 request_id: String::new(),
                 prompt_info: None,
                 token_ids: Vec::new(),
@@ -416,6 +425,7 @@ mod tests {
                 ec_transfer_params: None,
             }),
             Ok(GenerateOutput {
+                routed_experts: None,
                 request_id: String::new(),
                 prompt_info: Some(GeneratePromptInfo {
                     prompt_token_ids: Arc::from([11_u32, 22_u32]),
@@ -486,6 +496,7 @@ mod tests {
             token_ids: vec![3],
             logprobs: None,
             finish_reason: FinishReason::stop_eos(),
+            routed_experts: None,
             usage: vllm_llm::TokenUsage {
                 prompt_token_count: prompt_token_ids.len(),
                 output_token_count: 1,

@@ -66,7 +66,13 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         instance_id: "test-instance".to_string(),
         kv_cache_size_tokens: None,
         kv_cache_max_concurrency: None,
-        kv_events_config: None,
+        kv_role: None,
+        kv_events_publisher: None,
+        kv_events_endpoint: None,
+        kv_events_topic: None,
+        kv_event_block_size: DEFAULT_MOCK_BLOCK_SIZE,
+        supports_lora: false,
+        max_loras: 0,
     }
 }
 

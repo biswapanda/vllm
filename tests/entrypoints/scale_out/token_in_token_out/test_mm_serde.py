@@ -112,3 +112,16 @@ def test_mm_features_with_kwargs_data():
 
     decoded = decode_mm_kwargs_item(features2.kwargs_data["image"][0])
     assert torch.equal(elem.data, decoded["pixel_values"].data)
+
+
+def test_legacy_disagg_mm_serde_import_is_compatible():
+    """Existing renderer clients can follow the module's scale-out move."""
+    from vllm.entrypoints.serve.disagg.mm_serde import (
+        decode_mm_kwargs_item as legacy_decode,
+    )
+    from vllm.entrypoints.serve.disagg.mm_serde import (
+        encode_mm_kwargs_item as legacy_encode,
+    )
+
+    assert legacy_encode is encode_mm_kwargs_item
+    assert legacy_decode is decode_mm_kwargs_item
