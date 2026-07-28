@@ -23,14 +23,22 @@ where
     let mut ready = default_ready_response();
     ready.supports_lora = true;
     ready.max_loras = 1;
-    let (service, engine_health, engine_task) =
-        setup_grpc_service_with_ready_and_engine(engine_id, ready, run).await;
-    let service = service
-        .with_lora_allowed_path_prefixes(allowed_path_prefixes)
-        .with_runtime_lora_updating(runtime_updates_enabled);
-    let (_generate, control, _health, server_task, engine_task) =
-        start_grpc_test_server(service, engine_health, engine_task).await;
-    (control, server_task, engine_task)
+    let (state, engine_health, engine_task) =
+        setup_state_with_ready_and_engine(engine_id, ready, run).await;
+    let control_service = ControlServer::new(
+        ControlServiceImpl::new(state.clone())
+            .with_lora_allowed_path_prefixes(allowed_path_prefixes)
+            .with_runtime_lora_updating(runtime_updates_enabled),
+    );
+    let inference_service = InferenceServer::new(InferenceServiceImpl::new(state));
+    let (channel, server_task) = start_grpc_test_server(
+        inference_service,
+        control_service,
+        engine_health,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    (ControlClient::new(channel), server_task, engine_task)
 }
 
 async fn send_utility_result(push: &mut PushSocket, call_id: u64, result: bool) {

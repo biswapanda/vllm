@@ -247,16 +247,13 @@ where
         let engine_health = state.engine_core_client().subscribe_health();
         health_reporter.set_serving::<grpc::InferenceGrpcService>().await;
         health_reporter.set_serving::<grpc::ControlGrpcService>().await;
-        let admission = std::sync::Arc::new(grpc::AdmissionState::default());
-        let control_service = grpc::ControlGrpcService::new(grpc::ControlServiceImpl::with_admission(
-            state.clone(),
-            admission.clone(),
-            Some(health_reporter.clone()),
-        ));
-        let inference_service = grpc::InferenceGrpcService::new(
-            grpc::InferenceServiceImpl::with_admission(state.clone(), admission),
-        )
-        .max_decoding_message_size(GRPC_MAX_REQUEST_SIZE);
+        let control_service = grpc::ControlGrpcService::new(
+            grpc::ControlServiceImpl::new(state.clone())
+                .with_health_reporter(health_reporter.clone()),
+        );
+        let inference_service =
+            grpc::InferenceGrpcService::new(grpc::InferenceServiceImpl::new(state.clone()))
+                .max_decoding_message_size(GRPC_MAX_REQUEST_SIZE);
         let svc = TonicServer::builder()
             .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))

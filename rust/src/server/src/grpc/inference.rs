@@ -13,7 +13,7 @@ use tracing::info;
 use vllm_text::{DecodedTextEvent, Prompt, TextOutputStreamExt as _, TextRequest};
 
 use super::convert::{self, ResponseOpts};
-use super::{AdmissionState, InferenceServer, pb};
+use super::{InferenceServer, pb};
 use crate::state::AppState;
 
 pub(crate) type InferenceGrpcService = InferenceServer<InferenceServiceImpl>;
@@ -21,16 +21,11 @@ pub(crate) type InferenceGrpcService = InferenceServer<InferenceServiceImpl>;
 /// gRPC inference service backed by the shared application state.
 pub struct InferenceServiceImpl {
     state: Arc<AppState>,
-    admission: Arc<AdmissionState>,
 }
 
 impl InferenceServiceImpl {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self::with_admission(state, Arc::new(AdmissionState::default()))
-    }
-
-    pub(crate) fn with_admission(state: Arc<AppState>, admission: Arc<AdmissionState>) -> Self {
-        Self { state, admission }
+        Self { state }
     }
 
     async fn prepare_request(
@@ -102,7 +97,8 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<pb::GenerateResponse>, Status> {
         let _guard = self
-            .admission
+            .state
+            .admission()
             .try_admit()
             .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();
@@ -153,7 +149,8 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStreamStream>, Status> {
         let guard = self
-            .admission
+            .state
+            .admission()
             .try_admit()
             .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();

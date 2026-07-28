@@ -9,7 +9,7 @@ use tonic::{Request, Response, Status};
 use tonic_health::server::HealthReporter;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 
-use super::{AdmissionGuard, AdmissionState, ControlServer, lora_rpc, pb};
+use super::{AdmissionGuard, ControlServer, lora_rpc, pb};
 use crate::lora_path::runtime_lora_allowed_path_prefixes;
 use crate::state::AppState;
 
@@ -25,7 +25,6 @@ const GRPC_CAPABILITIES: &[&str] = &[
 /// gRPC control service backed by the shared application state.
 pub struct ControlServiceImpl {
     state: Arc<AppState>,
-    admission: Arc<AdmissionState>,
     health_reporter: Option<HealthReporter>,
     lora_allowed_path_prefixes: Option<Arc<[PathBuf]>>,
     runtime_lora_updating_enabled: bool,
@@ -33,21 +32,18 @@ pub struct ControlServiceImpl {
 
 impl ControlServiceImpl {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self::with_admission(state, Arc::new(AdmissionState::default()), None)
-    }
-
-    pub(crate) fn with_admission(
-        state: Arc<AppState>,
-        admission: Arc<AdmissionState>,
-        health_reporter: Option<HealthReporter>,
-    ) -> Self {
         Self {
             state,
-            admission,
-            health_reporter,
+            health_reporter: None,
             lora_allowed_path_prefixes: runtime_lora_allowed_path_prefixes().map(Arc::from),
             runtime_lora_updating_enabled: crate::routes::runtime_lora_updating_enabled(),
         }
+    }
+
+    /// Report `NOT_SERVING` on `Drain` so load balancers stop routing here.
+    pub(crate) fn with_health_reporter(mut self, health_reporter: HealthReporter) -> Self {
+        self.health_reporter = Some(health_reporter);
+        self
     }
 
     #[cfg(test)]
@@ -88,7 +84,7 @@ impl ControlServiceImpl {
     }
 
     fn try_admit(&self) -> Option<AdmissionGuard> {
-        self.admission.try_admit()
+        self.state.admission().try_admit()
     }
 }
 
@@ -168,9 +164,9 @@ impl pb::control_server::Control for ControlServiceImpl {
         &self,
         _request: Request<pb::DrainRequest>,
     ) -> Result<Response<pb::DrainResponse>, Status> {
-        self.admission.begin_drain();
+        self.state.admission().begin_drain();
         self.report_not_serving().await;
-        let in_flight = self.admission.in_flight().min(u64::from(u32::MAX)) as u32;
+        let in_flight = self.state.admission().in_flight().min(u64::from(u32::MAX)) as u32;
         let state = if in_flight == 0 {
             pb::DrainState::Complete
         } else {

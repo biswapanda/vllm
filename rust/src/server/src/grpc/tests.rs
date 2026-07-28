@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -117,10 +120,10 @@ fn request_output(
         stop_reason: None,
         events: None,
         kv_transfer_params: None,
+        ec_transfer_params: None,
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
-        ec_transfer_params: None,
         num_nans_in_logits: 0,
     }
 }
@@ -157,10 +160,6 @@ async fn send_outputs(push: &mut PushSocket, outputs: EngineCoreOutputs) {
 
 async fn recv_engine_message(dealer: &mut DealerSocket) -> Vec<bytes::Bytes> {
     dealer.recv().await.expect("recv engine message").into_vec()
-}
-
-fn test_llm(client: EngineCoreClient) -> Llm {
-    Llm::new(client).with_request_id_randomization(false)
 }
 
 #[derive(Clone, Debug)]
@@ -250,22 +249,62 @@ async fn setup_grpc_service(
     let engine_health = client.subscribe_health();
 
     let chat = ChatLlm::from_shared_backend(
-        test_llm(client),
+        Llm::new(client),
         Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
     );
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
-    // Inference and control must share one AdmissionState so `Drain` on the
-    // control service stops the inference service admitting new work.
-    let admission = std::sync::Arc::new(super::AdmissionState::default());
     (
-        InferenceServer::new(InferenceServiceImpl::with_admission(
-            state.clone(),
-            admission.clone(),
-        )),
-        ControlServer::new(ControlServiceImpl::with_admission(state, admission, None)),
+        InferenceServer::new(InferenceServiceImpl::new(state.clone())),
+        ControlServer::new(ControlServiceImpl::new(state)),
         engine_health,
         engine_task,
     )
+}
+
+/// Build only the shared `AppState` from a mock engine with a caller-supplied
+/// ready response, so a test can configure the services itself (e.g. LoRA
+/// path prefixes on the control service).
+async fn setup_state_with_ready_and_engine<F>(
+    engine_id: impl Into<EngineId>,
+    ready_response: vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse,
+    run: F,
+) -> (
+    Arc<AppState>,
+    tokio::sync::watch::Receiver<bool>,
+    MockEngineTask,
+)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = engine_id.into();
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_ready(
+        handshake_address.clone(),
+        engine_id.clone(),
+        ready_response,
+        run,
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let engine_health = client.subscribe_health();
+
+    let chat = ChatLlm::from_shared_backend(
+        Llm::new(client),
+        Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
+    );
+    let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
+    (state, engine_health, engine_task)
 }
 
 /// Spin up a plaintext gRPC server backed by a mock engine. Returns the client,
@@ -1493,3 +1532,5 @@ async fn grpc_health_watch_closes_on_graceful_shutdown() {
         .expect("timed out waiting for gRPC server shutdown")
         .expect("gRPC server task failed");
 }
+
+mod lora;

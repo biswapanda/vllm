@@ -55,6 +55,8 @@ pub struct AppState {
     /// Profiler mode that registers `/start_profile` and `/stop_profile`
     /// routes when present.
     pub profiler: Option<String>,
+    /// gRPC drain/admission state, shared by the inference and control services.
+    admission: Arc<crate::grpc::AdmissionState>,
 }
 
 impl AppState {
@@ -83,7 +85,13 @@ impl AppState {
             model_path: None,
             request_runtime: OnceLock::new(),
             profiler: None,
+            admission: Arc::new(crate::grpc::AdmissionState::default()),
         }
+    }
+
+    /// Drain/admission state shared by the gRPC inference and control services.
+    pub(crate) fn admission(&self) -> &Arc<crate::grpc::AdmissionState> {
+        &self.admission
     }
 
     /// Set HTTP/API-server behavior switches.

@@ -504,7 +504,6 @@ mod tests {
             },
             kv_transfer_params: None,
             ec_transfer_params: None,
-            routed_experts: None,
             prompt_token_ids,
         };
 
