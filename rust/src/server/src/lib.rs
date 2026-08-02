@@ -66,9 +66,7 @@ const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 const GRPC_LORA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 async fn set_generate_not_serving(health_reporter: &HealthReporter) {
-    health_reporter
-        .set_not_serving::<grpc::InferenceGrpcService>()
-        .await;
+    health_reporter.set_not_serving::<grpc::InferenceGrpcService>().await;
     health_reporter.set_service_status("", ServingStatus::NotServing).await;
 }
 

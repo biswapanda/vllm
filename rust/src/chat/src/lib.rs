@@ -298,10 +298,7 @@ impl ChatLlm {
             .backend
             .multimodal_model_info()
             .ok_or(Error::UnsupportedMultimodalRenderer)?;
-        let model_dtype = self
-            .processor
-            .model_dtype
-            .ok_or(Error::UnsupportedMultimodalRenderer)?;
+        let model_dtype = self.processor.model_dtype.ok_or(Error::UnsupportedMultimodalRenderer)?;
         let features = info.prepare_multimodal(media, token_ids, model_dtype).await?;
         Ok(Some(features))
     }
