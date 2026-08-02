@@ -4,9 +4,11 @@
 use std::collections::BTreeSet;
 
 pub(crate) mod logprobs;
+pub(crate) mod sampling;
 pub(crate) mod token_ids;
 
 use logprobs::validate_logprobs;
+use sampling::validate_resolved_sampling_params;
 use token_ids::{validate_prompt_token_ids, validate_vocab_range};
 use vllm_engine_core_client::protocol::sampling::{
     EngineCoreSamplingParams, RepetitionDetectionParams,
@@ -188,6 +190,7 @@ pub fn lower_sampling_params(
         skip_reading_prefix_cache,
         extra_args: vllm_xargs,
     };
+    validate_resolved_sampling_params(&params)?;
     validate_vocab_range(&params, &sampling_limits)?;
     Ok(params)
 }

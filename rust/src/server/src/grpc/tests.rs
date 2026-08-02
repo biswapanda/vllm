@@ -29,7 +29,6 @@ use vllm_engine_core_client::mock_engine::{
     DEFAULT_MOCK_BLOCK_SIZE, DEFAULT_MOCK_MAX_MODEL_LEN, DEFAULT_MOCK_NUM_GPU_BLOCKS,
     default_ready_response,
 };
-use vllm_engine_core_client::protocol::handshake::KvEventsConfig;
 use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
 };
@@ -711,7 +710,7 @@ async fn unary_generate_invalid_sampling_params_returns_invalid_argument() {
             model: "test-model".to_string(),
             prompt: Some(pb::generate_request::Prompt::Text("hi".to_string())),
             sampling: Some(pb::RandomSampling {
-                top_p: 2.0,
+                top_p: Some(2.0),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1372,33 +1371,20 @@ async fn control_aggregates_multi_engine_capacity() {
 fn kv_event_source_filters_and_exposes_zmq_publisher() {
     let mut ready = default_ready_response();
     ready.data_parallel_rank = 2;
-    ready.kv_events_config = Some(KvEventsConfig {
-        enable_kv_cache_events: false,
-        publisher: "null".to_string(),
-        endpoint: "tcp://*:5559".to_string(),
-        replay_endpoint: Some("tcp://*:5560".to_string()),
-        buffer_steps: 10_000,
-        hwm: 100_000,
-        max_queue_size: 100_000,
-        topic: "kv".to_string(),
-    });
+    ready.kv_events_publisher = Some("null".to_string());
+    ready.kv_events_endpoint = Some("tcp://*:5559".to_string());
+    ready.kv_events_topic = Some("kv".to_string());
 
     assert!(kv_event_source(&ready).is_none());
 
-    let config = ready.kv_events_config.as_mut().unwrap();
-    config.enable_kv_cache_events = true;
-    config.publisher = "zmq".to_string();
+    ready.kv_events_publisher = Some("zmq".to_string());
     let source = kv_event_source(&ready).expect("configured ZMQ event source");
     assert_eq!(source.transport, "zmq");
-    assert_eq!(source.endpoint, "tcp://*:5559");
     assert_eq!(source.topic, "kv");
-    assert_eq!(source.replay_endpoint, "tcp://*:5560");
     assert_eq!(source.data_parallel_rank, Some(2));
     assert_eq!(source.encoding, "msgpack");
     assert_eq!(source.schema_version, 1);
-    assert_eq!(source.buffer_steps, 10_000);
-    assert_eq!(source.hwm, 100_000);
-    assert_eq!(source.max_queue_size, 100_000);
+    assert_eq!(source.endpoint_addr.unwrap().port, 5561);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

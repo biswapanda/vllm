@@ -273,7 +273,7 @@ fn routed_experts_to_proto(tensor: &WireTensor) -> pb::RoutedExpertsTensor {
     pb::RoutedExpertsTensor {
         dtype: tensor.dtype.clone(),
         shape: tensor.shape.iter().map(|&dim| dim as u64).collect(),
-        data,
+        data: data.to_vec(),
     }
 }
 

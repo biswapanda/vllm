@@ -236,7 +236,7 @@ impl pb::control_server::Control for ControlServiceImpl {
     }
 }
 
-fn kv_event_source(response: &EngineCoreReadyResponse) -> Option<pb::KvEventSource> {
+pub(super) fn kv_event_source(response: &EngineCoreReadyResponse) -> Option<pb::KvEventSource> {
     if response.kv_events_publisher.as_deref() != Some("zmq") {
         return None;
     }

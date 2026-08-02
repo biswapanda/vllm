@@ -257,4 +257,3 @@ message PreprocessedMultimodalFeature {
   // Canonical cache identity derived from modality and kwargs_msgpack.
   string cache_identifier = 5;
 }
-

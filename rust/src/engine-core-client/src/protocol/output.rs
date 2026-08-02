@@ -173,7 +173,8 @@ where
                 ),
             })?
             .as_ref()
-            .to_vec(),
+            .to_vec()
+            .into(),
     };
     let expected = shape
         .checked_numel()
@@ -206,12 +207,13 @@ pub fn concatenate_routed_experts(
     let Some(mut combined) = chunks.next() else {
         return Ok(None);
     };
-    let WireArrayData::RawView(combined_data) = &mut combined.data else {
+    let WireArrayData::RawView(initial_data) = &combined.data else {
         return Err(Error::Decode {
             target_type: "EngineCoreOutput.routed_experts",
             message: "unresolved auxiliary payload".to_string(),
         });
     };
+    let mut combined_data = initial_data.to_vec();
     for chunk in chunks {
         if chunk.dtype != combined.dtype
             || chunk.shape.len() != combined.shape.len()
@@ -233,8 +235,9 @@ pub fn concatenate_routed_experts(
                 message: "unresolved auxiliary payload".to_string(),
             });
         };
-        combined_data.extend(data);
+        combined_data.extend_from_slice(&data);
     }
+    combined.data = WireArrayData::RawView(combined_data.into());
     Ok(Some(combined))
 }
 
@@ -528,7 +531,7 @@ mod tests {
             decoded.as_request_batch().unwrap().outputs[0].routed_experts.as_ref().unwrap();
         assert_eq!(routed.dtype, "|u1");
         assert_eq!(routed.shape, vec![1, 2, 2]);
-        assert_eq!(routed.data.as_raw_view().unwrap(), &[1, 2, 3, 4]);
+        assert_eq!(&routed.data.as_raw_view().unwrap()[..], &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -541,7 +544,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(combined.shape, vec![3, 2, 1]);
-        assert_eq!(combined.data.as_raw_view().unwrap(), &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            &combined.data.as_raw_view().unwrap()[..],
+            &[1, 2, 3, 4, 5, 6]
+        );
     }
 
     #[test]
