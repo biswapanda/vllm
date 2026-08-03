@@ -29,7 +29,6 @@ use vllm_engine_core_client::mock_engine::{
     DEFAULT_MOCK_BLOCK_SIZE, DEFAULT_MOCK_MAX_MODEL_LEN, DEFAULT_MOCK_NUM_GPU_BLOCKS,
     default_ready_response,
 };
-use vllm_engine_core_client::protocol::handshake::KvEventsConfig;
 use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
 };
@@ -259,6 +258,52 @@ async fn setup_grpc_service(
         engine_health,
         engine_task,
     )
+}
+
+/// Build only the shared `AppState` from a mock engine with a caller-supplied
+/// ready response, so a test can configure the services itself (e.g. LoRA
+/// path prefixes on the control service).
+async fn setup_state_with_ready_and_engine<F>(
+    engine_id: impl Into<EngineId>,
+    ready_response: vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse,
+    run: F,
+) -> (
+    Arc<AppState>,
+    tokio::sync::watch::Receiver<bool>,
+    MockEngineTask,
+)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = engine_id.into();
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_ready(
+        handshake_address.clone(),
+        engine_id.clone(),
+        ready_response,
+        run,
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let engine_health = client.subscribe_health();
+
+    let chat = ChatLlm::from_shared_backend(
+        Llm::new(client),
+        Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
+    );
+    let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
+    (state, engine_health, engine_task)
 }
 
 /// Spin up a plaintext gRPC server backed by a mock engine. Returns the client,
@@ -665,7 +710,7 @@ async fn unary_generate_invalid_sampling_params_returns_invalid_argument() {
             model: "test-model".to_string(),
             prompt: Some(pb::generate_request::Prompt::Text("hi".to_string())),
             sampling: Some(pb::RandomSampling {
-                top_p: 2.0,
+                top_p: Some(2.0),
                 ..Default::default()
             }),
             ..Default::default()
@@ -811,8 +856,8 @@ async fn unary_generate_with_sampling_params() {
             prompt: Some(pb::generate_request::Prompt::Text("test".to_string())),
             temperature: Some(0.7),
             sampling: Some(pb::RandomSampling {
-                top_k: 50,
-                top_p: 0.9,
+                top_k: Some(50),
+                top_p: Some(0.9),
                 seed: Some(42),
                 ..Default::default()
             }),
@@ -1326,33 +1371,20 @@ async fn control_aggregates_multi_engine_capacity() {
 fn kv_event_source_filters_and_exposes_zmq_publisher() {
     let mut ready = default_ready_response();
     ready.data_parallel_rank = 2;
-    ready.kv_events_config = Some(KvEventsConfig {
-        enable_kv_cache_events: false,
-        publisher: "null".to_string(),
-        endpoint: "tcp://*:5559".to_string(),
-        replay_endpoint: Some("tcp://*:5560".to_string()),
-        buffer_steps: 10_000,
-        hwm: 100_000,
-        max_queue_size: 100_000,
-        topic: "kv".to_string(),
-    });
+    ready.kv_events_publisher = Some("null".to_string());
+    ready.kv_events_endpoint = Some("tcp://*:5559".to_string());
+    ready.kv_events_topic = Some("kv".to_string());
 
     assert!(kv_event_source(&ready).is_none());
 
-    let config = ready.kv_events_config.as_mut().unwrap();
-    config.enable_kv_cache_events = true;
-    config.publisher = "zmq".to_string();
+    ready.kv_events_publisher = Some("zmq".to_string());
     let source = kv_event_source(&ready).expect("configured ZMQ event source");
     assert_eq!(source.transport, "zmq");
-    assert_eq!(source.endpoint, "tcp://*:5559");
     assert_eq!(source.topic, "kv");
-    assert_eq!(source.replay_endpoint, "tcp://*:5560");
     assert_eq!(source.data_parallel_rank, Some(2));
     assert_eq!(source.encoding, "msgpack");
     assert_eq!(source.schema_version, 1);
-    assert_eq!(source.buffer_steps, 10_000);
-    assert_eq!(source.hwm, 100_000);
-    assert_eq!(source.max_queue_size, 100_000);
+    assert_eq!(source.endpoint_addr.unwrap().port, 5561);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1486,3 +1518,5 @@ async fn grpc_health_watch_closes_on_graceful_shutdown() {
         .expect("timed out waiting for gRPC server shutdown")
         .expect("gRPC server task failed");
 }
+
+mod lora;

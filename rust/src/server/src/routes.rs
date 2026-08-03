@@ -39,7 +39,7 @@ fn server_dev_mode_enabled() -> bool {
         .is_some_and(|value| value != 0)
 }
 
-fn runtime_lora_updating_enabled() -> bool {
+pub(crate) fn runtime_lora_updating_enabled() -> bool {
     std::env::var("VLLM_ALLOW_RUNTIME_LORA_UPDATING")
         .ok()
         .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true"))

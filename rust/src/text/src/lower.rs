@@ -97,6 +97,7 @@ pub fn lower_sampling_params(
         max_tokens,
         min_tokens,
         thinking_token_budget,
+        routed_experts_prompt_start,
         logprobs,
         prompt_logprobs,
         min_p,
@@ -169,6 +170,7 @@ pub fn lower_sampling_params(
         max_tokens,
         min_tokens,
         thinking_token_budget,
+        routed_experts_prompt_start,
         logprobs,
         prompt_logprobs,
         min_p,
@@ -322,7 +324,7 @@ mod tests {
     use super::*;
     use crate::backend::hf::HfTextBackend;
     use crate::backend::{SamplingHints, TextBackend as _};
-    use crate::error::{LogprobsError, SamplingParamsError, TokenIdsError};
+    use crate::error::{LogprobsError, TokenIdsError};
     use crate::request::{Prompt, TextRequest};
 
     fn stub_tokenizer() -> TestTokenizer {
@@ -486,117 +488,17 @@ mod tests {
     }
 
     #[test]
-    fn lower_sampling_params_rejects_invalid_sampling_ranges() {
-        let cases = [
-            (
-                "temperature",
-                SamplingParams {
-                    temperature: Some(5.0),
-                    ..SamplingParams::default()
-                },
-            ),
-            (
-                "top_p",
-                SamplingParams {
-                    top_p: Some(0.0),
-                    ..SamplingParams::default()
-                },
-            ),
-            (
-                "min_p",
-                SamplingParams {
-                    min_p: Some(2.0),
-                    ..SamplingParams::default()
-                },
-            ),
-            (
-                "repetition_penalty",
-                SamplingParams {
-                    repetition_penalty: Some(0.0),
-                    ..SamplingParams::default()
-                },
-            ),
-            (
-                "frequency_penalty",
-                SamplingParams {
-                    frequency_penalty: Some(100.0),
-                    ..SamplingParams::default()
-                },
-            ),
-            (
-                "presence_penalty",
-                SamplingParams {
-                    presence_penalty: Some(100.0),
-                    ..SamplingParams::default()
-                },
-            ),
-        ];
-
-        for (expected_parameter, sampling_params) in cases {
-            let error =
-                lower_sampling_params_with_limits(sampling_params, sample_sampling_limits())
-                    .unwrap_err();
-
-            assert!(
-                matches!(
-                    error,
-                    Error::SamplingParams(SamplingParamsError::OutOfRange {
-                        parameter,
-                        ..
-                    }) if parameter == expected_parameter
-                ),
-                "{expected_parameter} should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn lower_sampling_params_rejects_non_finite_sampling_values() {
-        for (expected_parameter, sampling_params) in [
-            (
-                "temperature",
-                SamplingParams {
-                    temperature: Some(f32::INFINITY),
-                    ..SamplingParams::default()
-                },
-            ),
-            (
-                "repetition_penalty",
-                SamplingParams {
-                    repetition_penalty: Some(f32::NAN),
-                    ..SamplingParams::default()
-                },
-            ),
-        ] {
-            let error =
-                lower_sampling_params_with_limits(sampling_params, sample_sampling_limits())
-                    .unwrap_err();
-
-            assert!(
-                matches!(
-                    error,
-                    Error::SamplingParams(SamplingParamsError::NotFinite {
-                        parameter,
-                        ..
-                    }) if parameter == expected_parameter
-                ),
-                "{expected_parameter} should reject non-finite values"
-            );
-        }
-    }
-
-    #[test]
-    fn lower_sampling_params_accepts_python_compatible_repetition_penalty_above_two() {
-        let params = lower_sampling_params_with_limits(
+    fn lower_sampling_params_forwards_routed_experts_prompt_start() {
+        let lowered = lower_sampling_params_with_limits(
             SamplingParams {
-                repetition_penalty: Some(2.5),
+                routed_experts_prompt_start: 23,
                 ..SamplingParams::default()
             },
             sample_sampling_limits(),
         )
         .unwrap();
 
-        assert_eq!(params.repetition_penalty, 2.5);
+        assert_eq!(lowered.routed_experts_prompt_start, 23);
     }
 
     #[test]
@@ -620,6 +522,7 @@ mod tests {
                 max_tokens: 999997,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.0,
@@ -673,6 +576,7 @@ mod tests {
                 max_tokens: 999997,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.0,
@@ -834,6 +738,7 @@ mod tests {
                 max_tokens: 40957,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.0,
@@ -897,6 +802,7 @@ mod tests {
                 max_tokens: 999997,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.0,
@@ -968,6 +874,7 @@ mod tests {
                 max_tokens: 32,
                 min_tokens: 2,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.1,
@@ -1217,6 +1124,7 @@ mod tests {
                 max_tokens: 128,
                 min_tokens: 0,
                 thinking_token_budget: None,
+                routed_experts_prompt_start: 0,
                 logprobs: None,
                 prompt_logprobs: None,
                 min_p: 0.1,

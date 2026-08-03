@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
+use std::net::TcpListener;
 use std::ops::Deref;
 use std::time::Duration;
 
@@ -22,11 +23,13 @@ use crate::protocol::handshake::{
     EngineCoreReadyResponse, HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
 };
 use crate::protocol::output::{EngineCoreOutputs, decode_engine_core_outputs};
-use crate::protocol::{decode_msgpack, encode_msgpack};
+use crate::protocol::{OpaqueValue, decode_msgpack, encode_msgpack};
 
 /// Dedicated single-frame sentinel emitted by Python `EngineCoreProc` when the
 /// engine dies.
 pub const ENGINE_CORE_DEAD_SENTINEL: &[u8] = b"ENGINE_CORE_DEAD";
+
+const DATA_PARALLEL_BOOTSTRAP_PORT_COUNT: usize = 5;
 
 /// Opaque routing identity of one engine on the frontend transport.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -121,6 +124,8 @@ pub struct ConnectedTransport {
     pub output_address: String,
     /// All engines connected through the startup handshake.
     pub engines: Vec<ConnectedEngine>,
+    /// Validated contiguous data-parallel rank span managed by this transport.
+    pub managed_data_parallel_span: ManagedDataParallelSpan,
     /// Optional engine-facing coordinator transport used for in-process wave
     /// coordination.
     pub coordinator: Option<CoordinatorBootstrap>,
@@ -129,6 +134,13 @@ pub struct ConnectedTransport {
     pub input_send: RouterSendHalf,
     /// The shared output socket for receiving responses from all engines.
     pub output_socket: PullSocket,
+}
+
+/// Data-parallel ranks owned by one validated engine transport.
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedDataParallelSpan {
+    pub start_rank: u32,
+    pub size: u32,
 }
 
 #[derive(Clone, Debug, EnumAsInner)]
@@ -181,9 +193,10 @@ pub async fn connect_handshake(
     handshake_socket.bind(handshake_address).await?;
 
     let mut engines = BTreeMap::new();
+    let empty_parallel_config = BTreeMap::new();
 
-    // 3. Receive HELLO from every engine and send a matching INIT. When coordinator mode is
-    //    enabled, the engines will not emit READY until the coordinator barrier below completes.
+    // 3. Receive HELLO from every engine. Non-coordinated engines receive INIT immediately. A
+    //    coordinated cohort receives one shared DP bootstrap after every expected HELLO arrives.
     while engines.len() < engine_count {
         debug!(
             handshake_address,
@@ -207,17 +220,20 @@ pub async fn connect_handshake(
                 }
                 debug!(handshake_address, ?engine_id, "received HELLO from engine");
 
-                send_init_message(
-                    &mut handshake_socket,
-                    &engine_id,
-                    &input_address,
-                    &output_address,
-                    coordinator.as_ref(),
-                )
-                .await?;
-                debug!(handshake_address, ?engine_id, "sent INIT to engine");
-
                 engines.insert(engine_id.clone(), EngineStartupState::HelloReceived);
+
+                if coordinator.is_none() {
+                    send_init_message(
+                        &mut handshake_socket,
+                        &engine_id,
+                        &input_address,
+                        &output_address,
+                        None,
+                        &empty_parallel_config,
+                    )
+                    .await?;
+                    debug!(handshake_address, ?engine_id, "sent INIT to engine");
+                }
             }
             Some("READY") => {
                 if coordinator.is_some() {
@@ -244,6 +260,28 @@ pub async fn connect_handshake(
             other => {
                 bail_unexpected_handshake_message!("unexpected handshake status {other:?}");
             }
+        }
+    }
+
+    // Probe bootstrap ports only after the complete coordinated cohort is waiting for INIT. The
+    // reservations are released immediately before Python must bind them.
+    if coordinator.is_some() {
+        let parallel_config = data_parallel_bootstrap(local_host, engine_count)?;
+        for engine_id in engines.keys() {
+            send_init_message(
+                &mut handshake_socket,
+                engine_id,
+                &input_address,
+                &output_address,
+                coordinator.as_ref(),
+                &parallel_config,
+            )
+            .await?;
+            debug!(
+                handshake_address,
+                ?engine_id,
+                "sent coordinated INIT to engine"
+            );
         }
     }
 
@@ -298,7 +336,7 @@ pub async fn connect_handshake(
     }
 
     // 6. Wait for every engine to connect to the shared input socket and register itself.
-    let engines =
+    let (engines, managed_data_parallel_span) =
         wait_for_input_registrations(&mut input_socket, engines.into_keys(), ready_timeout).await?;
     debug!(
         engine_count = engines.len(),
@@ -315,6 +353,7 @@ pub async fn connect_handshake(
         input_send,
         output_socket,
         engines,
+        managed_data_parallel_span,
         coordinator,
     })
 }
@@ -343,7 +382,7 @@ pub async fn connect_bootstrapped(
     let mut output_socket = PullSocket::new();
     let output_address = output_socket.bind(output_address).await?.to_string();
 
-    let engines = wait_for_input_registrations(
+    let (engines, managed_data_parallel_span) = wait_for_input_registrations(
         &mut input_socket,
         (0..engine_count)
             .map(|offset| EngineId::from_engine_index(engine_start_index + offset as u32)),
@@ -361,6 +400,7 @@ pub async fn connect_bootstrapped(
         input_address,
         output_address,
         engines,
+        managed_data_parallel_span,
         coordinator: None,
         input_send,
         output_socket,
@@ -420,6 +460,7 @@ async fn send_init_message(
     input_address: &str,
     output_address: &str,
     coordinator: Option<&CoordinatorBootstrap>,
+    parallel_config: &BTreeMap<String, OpaqueValue>,
 ) -> Result<()> {
     let init_message = HandshakeInitMessage {
         addresses: HandshakeAddresses {
@@ -429,13 +470,56 @@ async fn send_init_message(
             coordinator_output: coordinator.map(|c| c.output_address.clone()),
             frontend_stats_publish_address: None,
         },
-        parallel_config: Default::default(),
+        parallel_config: parallel_config.clone(),
     };
     let payload = encode_msgpack(&init_message)?;
     let message = ZmqMessage::try_from(vec![engine_id.to_frame(), Bytes::from(payload)])
         .expect("handshake router messages must contain identity and payload");
     handshake_socket.send(message).await?;
     Ok(())
+}
+
+/// Build the Python-compatible bootstrap shared by a coordinated DP cohort.
+///
+/// TCP listeners reserve distinct ports while the map is assembled. They must
+/// be released before INIT is sent because Python owns the actual listeners,
+/// leaving an unavoidable probe-to-bind race after this function returns.
+fn data_parallel_bootstrap(
+    advertised_host: &str,
+    engine_count: usize,
+) -> Result<BTreeMap<String, OpaqueValue>> {
+    if engine_count <= 1 {
+        return Ok(BTreeMap::new());
+    }
+
+    let listeners = (0..DATA_PARALLEL_BOOTSTRAP_PORT_COUNT)
+        .map(|_| TcpListener::bind((advertised_host, 0)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut ports = listeners
+        .iter()
+        .map(|listener| listener.local_addr().map(|address| u64::from(address.port())))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let master_port = ports.pop().expect("bootstrap port count is nonzero");
+    drop(listeners);
+
+    Ok(BTreeMap::from([
+        (
+            "_data_parallel_master_port_list".to_string(),
+            OpaqueValue::Array(ports.into_iter().map(OpaqueValue::from).collect()),
+        ),
+        (
+            "data_parallel_master_ip".to_string(),
+            OpaqueValue::from(advertised_host),
+        ),
+        (
+            "data_parallel_master_port".to_string(),
+            OpaqueValue::from(master_port),
+        ),
+        (
+            "data_parallel_size".to_string(),
+            OpaqueValue::from(engine_count as u64),
+        ),
+    ]))
 }
 
 /// Receive the input registration message from each engine and validate its
@@ -451,7 +535,7 @@ async fn wait_for_input_registrations(
     input_socket: &mut RouterSocket,
     expected_engines: impl IntoIterator<Item = EngineId>,
     ready_timeout: Duration,
-) -> Result<Vec<ConnectedEngine>> {
+) -> Result<(Vec<ConnectedEngine>, ManagedDataParallelSpan)> {
     let expected_engines = expected_engines.into_iter().collect::<Vec<_>>();
     let mut pending = expected_engines.iter().cloned().collect::<BTreeSet<_>>();
     let mut ready_responses = BTreeMap::new();
@@ -493,7 +577,7 @@ async fn wait_for_input_registrations(
         ready_responses.insert(actual_id, ready_response);
     }
 
-    Ok(expected_engines
+    let engines = expected_engines
         .into_iter()
         .map(|engine_id| {
             let ready_response = ready_responses
@@ -504,7 +588,110 @@ async fn wait_for_input_registrations(
                 ready_response,
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let managed_data_parallel_span = validate_ready_responses(&engines)?;
+    Ok((engines, managed_data_parallel_span))
+}
+
+/// Validate the private engine/frontend startup contract before publishing a
+/// client. Incomplete or internally inconsistent metadata is a startup error.
+fn validate_ready_responses(engines: &[ConnectedEngine]) -> Result<ManagedDataParallelSpan> {
+    let Some(first) = engines.first() else {
+        bail_unexpected_handshake_message!("no engine ready responses were received");
+    };
+    let expected = &first.ready_response;
+    let mut ranks = BTreeSet::new();
+
+    for engine in engines {
+        let response = &engine.ready_response;
+        if response.world_size == 0
+            || response.tensor_parallel_size == 0
+            || response.pipeline_parallel_size == 0
+            || response.data_parallel_size == 0
+            || response.max_num_seqs == 0
+            || response.max_num_batched_tokens == 0
+        {
+            bail_unexpected_handshake_message!(
+                "engine {:?} reported zero topology or scheduler capacity: {:?}",
+                engine.engine_id,
+                response
+            );
+        }
+        if response.data_parallel_rank as u64 >= response.data_parallel_size {
+            bail_unexpected_handshake_message!(
+                "engine {:?} reported data-parallel rank {} outside size {}",
+                engine.engine_id,
+                response.data_parallel_rank,
+                response.data_parallel_size
+            );
+        }
+        if !ranks.insert(response.data_parallel_rank) {
+            bail_unexpected_handshake_message!(
+                "duplicate data-parallel rank {} in engine ready responses",
+                response.data_parallel_rank
+            );
+        }
+        if response.data_parallel_size > 1
+            && let Some(engine_index) = engine.engine_id.engine_index()
+            && engine_index != response.data_parallel_rank
+        {
+            bail_unexpected_handshake_message!(
+                "engine identity rank {engine_index} does not match reported data-parallel rank {}",
+                response.data_parallel_rank
+            );
+        }
+        if response.supports_lora != (response.max_loras > 0) {
+            bail_unexpected_handshake_message!(
+                "engine {:?} reported inconsistent LoRA capability (supports_lora={}, max_loras={})",
+                engine.engine_id,
+                response.supports_lora,
+                response.max_loras
+            );
+        }
+
+        let uniform = response.block_size == expected.block_size
+            && response.dtype == expected.dtype
+            && response.vllm_version == expected.vllm_version
+            && response.world_size == expected.world_size
+            && response.data_parallel_size == expected.data_parallel_size
+            && response.tensor_parallel_size == expected.tensor_parallel_size
+            && response.pipeline_parallel_size == expected.pipeline_parallel_size
+            && response.decode_context_parallel_size == expected.decode_context_parallel_size
+            && response.max_num_seqs == expected.max_num_seqs
+            && response.max_num_batched_tokens == expected.max_num_batched_tokens
+            && response.kv_role == expected.kv_role
+            && response.kv_events_publisher == expected.kv_events_publisher
+            && response.kv_events_endpoint == expected.kv_events_endpoint
+            && response.kv_events_topic == expected.kv_events_topic
+            && response.kv_event_block_size == expected.kv_event_block_size
+            && response.supports_lora == expected.supports_lora
+            && response.max_loras == expected.max_loras;
+        if !uniform {
+            bail_unexpected_handshake_message!(
+                "engine {:?} reported topology or capabilities inconsistent with engine {:?}",
+                engine.engine_id,
+                first.engine_id
+            );
+        }
+    }
+
+    let start_rank =
+        *ranks.first().expect("non-empty engines produce non-empty data-parallel ranks");
+    let Ok(size) = u32::try_from(ranks.len()) else {
+        bail_unexpected_handshake_message!("managed data-parallel rank count exceeds u32");
+    };
+    for (offset, rank) in ranks.into_iter().enumerate() {
+        let Ok(offset) = u32::try_from(offset) else {
+            bail_unexpected_handshake_message!("managed data-parallel rank count exceeds u32");
+        };
+        if start_rank.checked_add(offset) != Some(rank) {
+            bail_unexpected_handshake_message!(
+                "managed data-parallel ranks must be contiguous, starting at rank {start_rank}"
+            );
+        }
+    }
+
+    Ok(ManagedDataParallelSpan { start_rank, size })
 }
 
 /// Send an encoded message to the engine through the input socket.
@@ -585,7 +772,9 @@ pub async fn run_output_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::bind_local_sockets;
+    use super::{ConnectedEngine, bind_local_sockets, validate_ready_responses};
+    use crate::EngineId;
+    use crate::mock_engine::default_ready_response;
 
     #[tokio::test]
     async fn bind_local_sockets_resolves_zero_port_bindings() {
@@ -595,5 +784,103 @@ mod tests {
         assert!(input_address.starts_with("tcp://127.0.0.1:"));
         assert!(output_address.starts_with("tcp://127.0.0.1:"));
         assert_ne!(input_address, output_address);
+    }
+
+    #[test]
+    fn ready_validation_accepts_uniform_data_parallel_metadata() {
+        let engines = [0, 1].map(|rank| {
+            let mut ready_response = default_ready_response();
+            ready_response.data_parallel_size = 2;
+            ready_response.data_parallel_rank = rank;
+            ConnectedEngine {
+                engine_id: EngineId::from_engine_index(rank),
+                ready_response,
+            }
+        });
+        validate_ready_responses(&engines).expect("valid ready responses");
+    }
+
+    #[test]
+    fn ready_validation_accepts_contiguous_offset_data_parallel_ranks() {
+        let engines = [2, 3].map(|rank| {
+            let mut ready_response = default_ready_response();
+            ready_response.data_parallel_size = 4;
+            ready_response.data_parallel_rank = rank;
+            ConnectedEngine {
+                engine_id: EngineId::from_engine_index(rank),
+                ready_response,
+            }
+        });
+        let span = validate_ready_responses(&engines).expect("contiguous offset ranks are valid");
+        assert_eq!(span.start_rank, 2);
+        assert_eq!(span.size, 2);
+    }
+
+    #[test]
+    fn ready_validation_rejects_noncontiguous_data_parallel_ranks() {
+        let engines = [0, 2].map(|rank| {
+            let mut ready_response = default_ready_response();
+            ready_response.data_parallel_size = 4;
+            ready_response.data_parallel_rank = rank;
+            ConnectedEngine {
+                engine_id: EngineId::from_engine_index(rank),
+                ready_response,
+            }
+        });
+        assert!(validate_ready_responses(&engines).is_err());
+    }
+
+    #[test]
+    fn ready_validation_rejects_duplicate_data_parallel_ranks() {
+        let engines = [0, 1].map(|rank| {
+            let mut ready_response = default_ready_response();
+            ready_response.data_parallel_size = 2;
+            ConnectedEngine {
+                engine_id: EngineId::from_engine_index(rank),
+                ready_response,
+            }
+        });
+        assert!(validate_ready_responses(&engines).is_err());
+    }
+
+    #[test]
+    fn ready_validation_rejects_duplicate_rank_for_single_rank_topology() {
+        let engines = [0, 1].map(|engine_index| ConnectedEngine {
+            engine_id: EngineId::from_engine_index(engine_index),
+            ready_response: default_ready_response(),
+        });
+        assert!(validate_ready_responses(&engines).is_err());
+    }
+
+    #[test]
+    fn ready_validation_rejects_nonuniform_topology() {
+        let mut first = default_ready_response();
+        first.data_parallel_size = 2;
+        let mut second = first.clone();
+        second.data_parallel_rank = 1;
+        second.tensor_parallel_size = 2;
+        let engines = [
+            ConnectedEngine {
+                engine_id: EngineId::from_engine_index(0),
+                ready_response: first,
+            },
+            ConnectedEngine {
+                engine_id: EngineId::from_engine_index(1),
+                ready_response: second,
+            },
+        ];
+        assert!(validate_ready_responses(&engines).is_err());
+    }
+
+    #[test]
+    fn ready_validation_rejects_inconsistent_lora_capacity() {
+        let mut ready_response = default_ready_response();
+        ready_response.supports_lora = true;
+        ready_response.max_loras = 0;
+        let engines = [ConnectedEngine {
+            engine_id: EngineId::from_engine_index(0),
+            ready_response,
+        }];
+        assert!(validate_ready_responses(&engines).is_err());
     }
 }

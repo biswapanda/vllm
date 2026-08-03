@@ -15,7 +15,9 @@ use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::runtime::BackgroundShutdownRuntime;
 
 use crate::config::{ApiServerOptions, CorsConfig};
-use crate::lora::{LoadLoraError, LoraManager, LoraModelResolution, UnloadLoraError};
+use crate::lora::{
+    LoadExactLoraError, LoadLoraError, LoraManager, LoraModelResolution, UnloadLoraError,
+};
 use crate::runtime::build_request_runtime;
 use crate::server_info::{ServerInfoConfigFormat, ServerInfoSnapshot};
 
@@ -53,6 +55,8 @@ pub struct AppState {
     /// Profiler mode that registers `/start_profile` and `/stop_profile`
     /// routes when present.
     pub profiler: Option<String>,
+    /// gRPC drain/admission state, shared by the inference and control services.
+    admission: Arc<crate::grpc::AdmissionState>,
 }
 
 impl AppState {
@@ -81,7 +85,13 @@ impl AppState {
             model_path: None,
             request_runtime: OnceLock::new(),
             profiler: None,
+            admission: Arc::new(crate::grpc::AdmissionState::default()),
         }
+    }
+
+    /// Drain/admission state shared by the gRPC inference and control services.
+    pub(crate) fn admission(&self) -> &Arc<crate::grpc::AdmissionState> {
+        &self.admission
     }
 
     /// Set HTTP/API-server behavior switches.
@@ -161,6 +171,11 @@ impl AppState {
         self.lora_manager.served_lora_requests().await
     }
 
+    /// Whether the dynamic LoRA registry is known to match every engine rank.
+    pub(crate) fn lora_state_is_consistent(&self) -> bool {
+        self.lora_manager.is_consistent()
+    }
+
     /// Resolve the requested model against one dynamic LoRA registry snapshot.
     pub async fn resolve_model_with_loras(&self, model_name: Option<&str>) -> LoraModelResolution {
         self.lora_manager.resolve_model(&self.served_model_names, model_name).await
@@ -182,6 +197,22 @@ impl AppState {
                 lora_path,
                 load_inplace,
                 is_3d_lora_weight,
+            )
+            .await
+    }
+
+    /// Load one dynamic adapter with an externally assigned ID.
+    pub async fn load_lora_exact(
+        &self,
+        lora_request: LoraRequest,
+        load_inplace: bool,
+    ) -> Result<(LoraRequest, bool), LoadExactLoraError> {
+        self.lora_manager
+            .load_lora_exact(
+                self.engine_core_client(),
+                &self.served_model_names,
+                lora_request,
+                load_inplace,
             )
             .await
     }

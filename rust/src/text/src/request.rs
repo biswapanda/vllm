@@ -67,6 +67,8 @@ pub struct SamplingParams {
     /// here; `-1` is normalized to `None` (and other negatives rejected) during
     /// lowering (see `lower_sampling_params`).
     pub thinking_token_budget: Option<i64>,
+    /// Number of prompt-token rows to omit from returned routed-expert data.
+    pub routed_experts_prompt_start: u32,
     /// Number of log probabilities to return per generated token.
     ///
     /// `None` disables sample logprobs. `-1` requests the full vocabulary.
@@ -131,6 +133,7 @@ impl Default for SamplingParams {
             max_tokens: None,
             min_tokens: None,
             thinking_token_budget: None,
+            routed_experts_prompt_start: 0,
             logprobs: None,
             prompt_logprobs: None,
             min_p: None,

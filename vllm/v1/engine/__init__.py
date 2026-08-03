@@ -11,7 +11,6 @@ import msgspec
 import numpy as np
 import torch
 
-from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -36,6 +35,8 @@ FT_STATUS_CALL_ID = -2
 
 
 class EEPNotificationType(enum.Enum):
+    NEW_CORE_ENGINES_INIT_READY = "NEW_CORE_ENGINES_INIT_READY"
+    NEW_CORE_ENGINES_WEIGHTS_INIT_READY = "NEW_CORE_ENGINES_WEIGHTS_INIT_READY"
     RECONFIGURE_FINISHED = "RECONFIGURE_FINISHED"
     SHUTDOWN_COMPLETE = "SHUTDOWN_COMPLETE"
 
@@ -88,10 +89,16 @@ class EngineCoreReadyResponse:
     max_num_seqs: int
     max_num_batched_tokens: int
     instance_id: str
+    kv_event_block_size: int
+    supports_lora: bool
+    max_loras: int
     # KV cache capacity (None for encoder-only/attention-free models).
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
-    kv_events_config: KVEventsConfig | None = None
+    kv_role: str | None = None
+    kv_events_publisher: str | None = None
+    kv_events_endpoint: str | None = None
+    kv_events_topic: str | None = None
 
 
 class EngineCoreRequest(

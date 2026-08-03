@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::info;
-use vllm_text::{DecodedTextEvent, TextOutputStreamExt as _};
+use vllm_text::{DecodedTextEvent, Prompt, TextOutputStreamExt as _, TextRequest};
 
 use super::convert::{self, ResponseOpts};
 use super::{InferenceServer, pb};
@@ -27,6 +27,63 @@ impl InferenceServiceImpl {
     pub fn new(state: Arc<AppState>) -> Self {
         Self { state }
     }
+
+    async fn prepare_request(
+        &self,
+        proto_request: pb::GenerateRequest,
+        stream: bool,
+    ) -> Result<(TextRequest, crate::lora::LoraLease), Status> {
+        let ready = self.state.engine_core_client().ready_response();
+        let role = convert::role_from_kv_role(ready.kv_role.as_deref());
+        convert::validate_disaggregated_request(&proto_request, role)?;
+        let supports_lora = ready.supports_lora;
+        let media = convert::media_parts_from_request(&proto_request.media)?;
+        let lora_name = proto_request.lora_name.clone();
+        let mut text_request =
+            convert::to_text_request(proto_request, stream, self.state.served_model_names())?;
+
+        let mut lora_lease = None;
+        if !lora_name.is_empty() {
+            if !supports_lora {
+                return Err(Status::failed_precondition(
+                    "engine was not started with LoRA enabled",
+                ));
+            }
+            let mut resolution = self.state.resolve_model_with_loras(Some(&lora_name)).await;
+            lora_lease = resolution.lease.take();
+            if !self.state.lora_state_is_consistent() {
+                return Err(Status::failed_precondition(
+                    "LoRA state differs across engine ranks; restart the engine",
+                ));
+            }
+            text_request.lora_request = Some(resolution.lora_request.ok_or_else(|| {
+                Status::not_found(format!("LoRA adapter `{lora_name}` is not loaded"))
+            })?);
+        }
+        // Language-only LoRA does not change preprocessed multimodal features.
+        // Tower or connector adapters need an explicit cache-identity contract.
+        if !media.is_empty() {
+            let Prompt::TokenIds(mut token_ids) = text_request.prompt else {
+                return Err(Status::invalid_argument(
+                    "multimodal gRPC requests must provide token_ids input",
+                ));
+            };
+            let mm_features = self
+                .state
+                .chat
+                .prepare_media(media, &mut token_ids)
+                .await
+                .map_err(|error| Status::internal(error.to_report_string()))?;
+            text_request.prompt = Prompt::TokenIds(token_ids);
+            text_request.mm_features = mm_features;
+        }
+
+        if role == convert::KvRole::Prefill {
+            convert::mark_prefill_request(&mut text_request);
+        }
+
+        Ok((text_request, lora_lease))
+    }
 }
 
 #[tonic::async_trait]
@@ -39,16 +96,21 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         &self,
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<pb::GenerateResponse>, Status> {
+        let _guard = self
+            .state
+            .admission()
+            .try_admit()
+            .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
-        let text_request =
-            convert::to_text_request(proto_req, false, self.state.served_model_names())?;
+        let (text_request, lora_lease) = self.prepare_request(proto_req, false).await?;
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (unary)");
 
         let stream = self.state.chat.text().generate(text_request).await;
         let stream = stream.map_err(text_error_to_status)?;
+        let stream = crate::lora::hold_lora_lease(stream, lora_lease);
 
         let collected = stream.collect_output().await.map_err(text_error_to_status)?;
 
@@ -64,6 +126,7 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
             finish_reason: collected.finish_reason,
             kv_transfer_params: collected.kv_transfer_params,
             ec_transfer_params: collected.ec_transfer_params,
+            routed_experts: collected.routed_experts,
         };
 
         let outputs = convert::to_sequence_output(
@@ -85,20 +148,26 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         &self,
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStreamStream>, Status> {
+        let guard = self
+            .state
+            .admission()
+            .try_admit()
+            .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
-        let text_request =
-            convert::to_text_request(proto_req, true, self.state.served_model_names())?;
+        let (text_request, lora_lease) = self.prepare_request(proto_req, true).await?;
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (stream)");
 
         let stream = self.state.chat.text().generate(text_request).await;
         let stream = stream.map_err(text_error_to_status)?;
+        let stream = crate::lora::hold_lora_lease(stream, lora_lease);
 
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
+            let _guard = guard;
             futures::pin_mut!(stream);
             while let Some(event) = stream.next().await {
                 let response = match event {

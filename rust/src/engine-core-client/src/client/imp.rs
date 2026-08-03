@@ -118,6 +118,11 @@ impl ClientInner {
         self.utility_reg.lock().unregister_many(call_ids);
     }
 
+    #[cfg(test)]
+    pub fn pending_utility_call_count(&self) -> usize {
+        self.utility_reg.lock().len()
+    }
+
     /// Undo a request registration when `add_request()` fails.
     pub fn rollback_request(&self, request_id: &str) {
         let _ = self.request_reg.lock().remove(request_id);
@@ -315,14 +320,23 @@ impl ClientInner {
     /// recorded for this client. Later failures do not overwrite the first
     /// one so `/health` and post-close callers observe a stable cause.
     fn record_health_error(&self, error: Arc<Error>) -> Arc<Error> {
-        if let Some(existing) = self.health_error.load_full() {
-            return existing;
-        }
-        self.health_error
-            .rcu(|current| current.clone().unwrap_or_else(|| error.clone()));
-        self.health_error
-            .load_full()
-            .expect("health error must be recorded before registries close")
+        let persistent_error = if let Some(existing) = self.health_error.load_full() {
+            existing
+        } else {
+            self.health_error
+                .rcu(|current| current.clone().unwrap_or_else(|| error.clone()));
+            self.health_error
+                .load_full()
+                .expect("health error must be recorded before registries close")
+        };
+        self.health_tx.send_if_modified(|healthy| {
+            if !*healthy {
+                return false;
+            }
+            *healthy = false;
+            true
+        });
+        persistent_error
     }
 
     /// Publish the sticky healthy-to-unhealthy transition.

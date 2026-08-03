@@ -14,6 +14,7 @@ mod logprobs;
 use std::sync::Arc;
 
 use futures::{StreamExt as _, pin_mut};
+use vllm_engine_core_client::protocol::tensor::WireNdArray;
 
 use crate::{Error, FinishReason, Result, TextOutputStream};
 
@@ -32,6 +33,8 @@ pub struct CollectedTextOutput {
     /// Connector-specific encoder cache transfer parameters for disaggregated
     /// serving.
     pub ec_transfer_params: Option<serde_json::Value>,
+    /// Routed-expert IDs concatenated along the token axis.
+    pub routed_experts: Option<WireNdArray>,
 }
 
 #[allow(clippy::manual_async_fn, reason = "specify `Send` bound")]
@@ -84,6 +87,7 @@ impl<T: TextOutputStream> T {
                                 usage: vllm_llm::TokenUsage::default(),
                                 kv_transfer_params: None,
                                 ec_transfer_params: None,
+                                routed_experts: None,
                             })
                         };
 
@@ -93,6 +97,7 @@ impl<T: TextOutputStream> T {
                             collected.usage = finished.usage;
                             collected.kv_transfer_params = finished.kv_transfer_params;
                             collected.ec_transfer_params = finished.ec_transfer_params;
+                            collected.routed_experts = finished.routed_experts;
                             return Ok(collected);
                         }
                     }
@@ -165,6 +170,7 @@ mod tests {
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
                     ec_transfer_params: None,
+                    routed_experts: None,
                 }),
             }),
         ]);
@@ -283,6 +289,7 @@ mod tests {
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
                     ec_transfer_params: None,
+                    routed_experts: None,
                 }),
             }),
         ]);

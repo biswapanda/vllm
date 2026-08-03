@@ -86,6 +86,8 @@ pub struct EngineCoreSamplingParams {
     /// reaching this DTO, so only non-negative values are sent. Enforced
     /// engine-side (and only when a reasoning parser is configured).
     pub thinking_token_budget: Option<u64>,
+    /// Number of prompt-token rows to omit from returned routed-expert data.
+    pub routed_experts_prompt_start: u32,
     /// Number of log probabilities to return per generated token.
     ///
     /// `None` disables sample logprobs. `-1` requests the full vocabulary.
@@ -158,6 +160,7 @@ impl EngineCoreSamplingParams {
             max_tokens: 65536,
             min_tokens: 0,
             thinking_token_budget: None,
+            routed_experts_prompt_start: 0,
             logprobs: None,
             prompt_logprobs: None,
             min_p: 0.0,
