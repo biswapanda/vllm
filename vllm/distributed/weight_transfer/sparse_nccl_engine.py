@@ -302,7 +302,12 @@ class SparseNCCLTrainerWeightTransferEngine(
 
         return engine
 
-    def send_weights(self, patches: Iterable[SparseWeightPatch] | None = None) -> None:
+    def send_weights(
+        self,
+        patches: Iterable[SparseWeightPatch] | None = None,
+        *,
+        weight_version: str | None = None,
+    ) -> None:
         """Broadcast this round's sparse patches. `patches` is the per-round
         payload (sparse deltas differ every round), so it is passed here rather
         than fixed at init. Every patch must set `full_shape`."""
@@ -355,7 +360,10 @@ class SparseNCCLTrainerWeightTransferEngine(
             # return, so joining would turn the error into a permanent hang.
             # See NCCLTrainerWeightTransferEngine.send_weights.
             exe.shutdown(wait=False)
-        self.client.finish_weight_update()
+        if weight_version is None:
+            self.client.finish_weight_update()
+        else:
+            self.client.finish_weight_update(weight_version)
         self._post_send_sync()
 
     @staticmethod

@@ -1269,6 +1269,7 @@ class RecordingClient:
         self.order: list[str] = []
         self.last_init_info: dict | None = None
         self.last_update_info: dict | None = None
+        self.last_weight_version: str | None = None
 
     def init_weight_transfer_engine(self, init_info: dict) -> None:
         self.order.append("init")
@@ -1283,6 +1284,7 @@ class RecordingClient:
 
     def finish_weight_update(self, weight_version: str | None = None) -> None:
         self.order.append("finish")
+        self.last_weight_version = weight_version
 
 
 def _module_with(*pairs):
@@ -1496,13 +1498,14 @@ def test_ipc_trainer_send_weights_drives_client_in_order():
         packed=False,
     )
 
-    engine.send_weights()
+    engine.send_weights(weight_version="step-42")
 
     assert client.order == ["start", "update", "finish"]
     assert client.last_update_info is not None
     assert client.last_update_info["names"] == ["w"]
     assert client.last_update_info["shapes"] == [[4]]
     assert "packed" not in client.last_update_info
+    assert client.last_weight_version == "step-42"
 
 
 def test_ipc_trainer_init_ships_packed_to_worker():
@@ -1649,6 +1652,21 @@ def test_nccl_trainer_send_weights_drives_client_in_order():
     assert client.last_update_info["names"] == ["w"]
     assert client.last_update_info["shapes"] == [[4]]
     assert "packed" not in client.last_update_info
+
+
+def test_nccl_trainer_send_weights_commits_version(monkeypatch):
+    client = RecordingClient()
+    engine = NCCLTrainerWeightTransferEngine(
+        client=client,
+        source=ModuleSource(_module_with(("w", torch.zeros(4)))),
+        packed=False,
+    )
+    monkeypatch.setattr(engine, "_broadcast", lambda source, meta: None)
+    monkeypatch.setattr(engine, "_post_send_sync", lambda: None)
+
+    engine.send_weights(weight_version="step-42")
+
+    assert client.last_weight_version == "step-42"
 
 
 class _ScriptedSource(WeightSource):
@@ -1839,7 +1857,7 @@ def test_sparse_nccl_trainer_send_weights_drives_client_in_order(monkeypatch):
     # handle _post_send_sync can synchronize).
     monkeypatch.setattr(torch.cuda, "current_stream", MagicMock())
 
-    engine.send_weights([_sparse_patch()])
+    engine.send_weights([_sparse_patch()], weight_version="step-42")
 
     assert client.order == ["start", "update", "finish"]
     assert client.last_update_info is not None
@@ -1848,6 +1866,7 @@ def test_sparse_nccl_trainer_send_weights_drives_client_in_order(monkeypatch):
     assert client.last_update_info["num_updates_list"] == [2]
     # One broadcast for indices + one for values per patch.
     assert engine.model_update_group.broadcast.call_count == 2
+    assert client.last_weight_version == "step-42"
 
 
 def test_sparse_nccl_trainer_send_weights_empty_round_is_noop():

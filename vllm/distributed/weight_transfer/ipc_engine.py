@@ -304,7 +304,7 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI
             engine.client.init_weight_transfer_engine({"packed": init_info.packed})
         return engine
 
-    def send_weights(self) -> None:
+    def send_weights(self, *, weight_version: str | None = None) -> None:
         assert self.source is not None
         source = self.source
         if self.is_sender:
@@ -313,7 +313,10 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI
         # alive across `finish_weight_update` too.
         weight_refs = self._send(source)
         if self.is_sender:
-            self.client.finish_weight_update()
+            if weight_version is None:
+                self.client.finish_weight_update()
+            else:
+                self.client.finish_weight_update(weight_version)
         self._post_send_sync()
         del weight_refs
 

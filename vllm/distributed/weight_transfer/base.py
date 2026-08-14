@@ -441,11 +441,14 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
         raise NotImplementedError
 
     @abstractmethod
-    def send_weights(self) -> None:
+    def send_weights(self, *, weight_version: str | None = None) -> None:
         """Push weights to inference workers and drive the full update round
         trip: `start_weight_update`, `update_weights` (run concurrently with the
         trainer-side broadcast when the backend requires it), then
         `finish_weight_update`. Called on every trainer rank.
+
+        Args:
+            weight_version: Version committed after a successful update.
         """
         raise NotImplementedError
 

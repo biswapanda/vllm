@@ -308,7 +308,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
 
         return engine
 
-    def send_weights(self) -> None:
+    def send_weights(self, *, weight_version: str | None = None) -> None:
         assert self.source is not None  # guaranteed by trainer_init / __init__
         source = self.source
 
@@ -350,7 +350,10 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             # thread is still joined at interpreter exit, so a caller that wants
             # to exit cleanly after such a failure must not wait on it.)
             exe.shutdown(wait=False)
-        self.client.finish_weight_update()
+        if weight_version is None:
+            self.client.finish_weight_update()
+        else:
+            self.client.finish_weight_update(weight_version)
         self._post_send_sync()
 
     def _broadcast(self, source: WeightSource, meta: list[ParamMeta]) -> None:
