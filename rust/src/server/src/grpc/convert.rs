@@ -8,8 +8,12 @@ use tonic::Status;
 use url::Url;
 use uuid::Uuid;
 use vllm_chat::MediaContentPart;
+use vllm_engine_core_client::protocol::multimodal::{
+    MmFeatureSpec, MmFeatures, MmKwargsItem, PlaceholderRange,
+};
 use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams;
+use vllm_engine_core_client::protocol::tensor::WireTensor;
 use vllm_text::{
     DecodedLogprobs, DecodedPromptLogprobs, FinishReason, Finished, Prompt, SamplingParams,
     TextDecodeOptions, TextRequest,
@@ -17,28 +21,33 @@ use vllm_text::{
 
 use super::pb;
 
-pub fn media_parts_from_request(
+pub enum GrpcMultimodalInput {
+    None,
+    Raw(Vec<MediaContentPart>),
+    Preprocessed(MmFeatures),
+}
+
+pub fn multimodal_input_from_request(
     media: Vec<pb::MediaItem>,
-) -> Result<Vec<MediaContentPart>, Status> {
+) -> Result<GrpcMultimodalInput, Status> {
     let mut parts = Vec::with_capacity(media.len());
+    let mut features = Vec::with_capacity(media.len());
     for (index, item) in media.into_iter().enumerate() {
-        match item.modality() {
-            pb::Modality::Image => {}
+        let modality = match item.modality() {
+            pb::Modality::Image => "image",
+            pb::Modality::Video => "video",
+            pb::Modality::Audio => "audio",
             pb::Modality::Unspecified => {
                 return Err(Status::invalid_argument(format!(
                     "media[{index}].modality is required"
                 )));
             }
-            other => {
-                return Err(Status::unimplemented(format!(
-                    "media[{index}].modality {other:?} is not supported by the gRPC service"
-                )));
-            }
-        }
+        };
         let uuid = (!item.uuid.is_empty()).then_some(item.uuid);
         let mime_type = (!item.mime_type.is_empty()).then_some(item.mime_type);
         let part = match item.source {
             Some(pb::media_item::Source::Url(url)) => {
+                ensure_raw_image(index, modality)?;
                 validate_media_uri(index, "url", &url, &["http", "https"])?;
                 MediaContentPart::ImageUrl {
                     url,
@@ -47,6 +56,7 @@ pub fn media_parts_from_request(
                 }
             }
             Some(pb::media_item::Source::DataUri(uri)) => {
+                ensure_raw_image(index, modality)?;
                 validate_media_uri(index, "data_uri", &uri, &["data"])?;
                 MediaContentPart::ImageUrl {
                     url: uri,
@@ -54,21 +64,125 @@ pub fn media_parts_from_request(
                     uuid,
                 }
             }
-            Some(pb::media_item::Source::RawBytes(bytes)) => MediaContentPart::ImageData {
-                data: bytes,
-                mime_type,
-                uuid,
-                detail: None,
-            },
+            Some(pb::media_item::Source::RawBytes(bytes)) => {
+                ensure_raw_image(index, modality)?;
+                MediaContentPart::ImageData {
+                    data: bytes,
+                    mime_type,
+                    uuid,
+                    detail: None,
+                }
+            }
+            Some(pb::media_item::Source::Features(feature)) => {
+                if !parts.is_empty() {
+                    return Err(mixed_media_error());
+                }
+                features.push(preprocessed_feature(index, modality, feature)?);
+                continue;
+            }
             None => {
                 return Err(Status::invalid_argument(format!(
                     "media[{index}].source is required"
                 )));
             }
         };
+        if !features.is_empty() {
+            return Err(mixed_media_error());
+        }
         parts.push(part);
     }
-    Ok(parts)
+    if !features.is_empty() {
+        features.sort_unstable_by_key(|feature| feature.mm_position.offset);
+        Ok(GrpcMultimodalInput::Preprocessed(features))
+    } else if !parts.is_empty() {
+        Ok(GrpcMultimodalInput::Raw(parts))
+    } else {
+        Ok(GrpcMultimodalInput::None)
+    }
+}
+
+fn ensure_raw_image(index: usize, modality: &str) -> Result<(), Status> {
+    if modality == "image" {
+        Ok(())
+    } else {
+        Err(Status::unimplemented(format!(
+            "media[{index}] raw {modality} input is not supported by the gRPC service"
+        )))
+    }
+}
+
+fn mixed_media_error() -> Status {
+    Status::invalid_argument("raw media and preprocessed media features cannot be mixed")
+}
+
+fn preprocessed_feature(
+    index: usize,
+    modality: &str,
+    feature: pb::PreprocessedMediaFeatures,
+) -> Result<MmFeatureSpec, Status> {
+    if feature.identifier.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "media[{index}].features.identifier is required"
+        )));
+    }
+    let offset = usize::try_from(feature.offset).map_err(|_| {
+        Status::invalid_argument(format!(
+            "media[{index}].features.offset exceeds platform limits"
+        ))
+    })?;
+    let length = usize::try_from(feature.length).map_err(|_| {
+        Status::invalid_argument(format!(
+            "media[{index}].features.length exceeds platform limits"
+        ))
+    })?;
+    if length == 0 {
+        return Err(Status::invalid_argument(format!(
+            "media[{index}].features.length must be positive"
+        )));
+    }
+    offset.checked_add(length).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "media[{index}].features placeholder range overflows"
+        ))
+    })?;
+    let is_embed = if feature.is_embed.is_empty() {
+        None
+    } else {
+        if feature.is_embed.len() != length {
+            return Err(Status::invalid_argument(format!(
+                "media[{index}].features.is_embed length must equal placeholder length"
+            )));
+        }
+        Some(
+            WireTensor::from_bool(vec![length], feature.is_embed).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "media[{index}].features.is_embed is invalid: {error}"
+                ))
+            })?,
+        )
+    };
+    let data = feature
+        .kwargs
+        .map(|kwargs| {
+            rmp_serde::from_slice::<MmKwargsItem>(&kwargs).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "media[{index}].features.kwargs is invalid MessagePack: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+
+    Ok(MmFeatureSpec {
+        data,
+        modality: modality.to_string(),
+        identifier: feature.identifier,
+        mm_position: PlaceholderRange {
+            offset,
+            length,
+            is_embed,
+        },
+        mm_hash: feature.mm_hash.filter(|hash| !hash.is_empty()),
+    })
 }
 
 fn validate_media_uri(
@@ -262,6 +376,7 @@ fn build_sampling_params(
 
     // ResponseOptions → logprobs
     if let Some(r) = response {
+        params.routed_experts_prompt_start = r.routed_experts_prompt_start;
         if r.output_logprobs {
             let (count, token_ids) = candidate_logprob_spec(r.output_candidates.as_ref());
             params.logprobs = Some(count);
@@ -395,6 +510,21 @@ pub fn to_sequence_output(
         ranks: rank_values,
         candidate_tokens: candidates,
         finish_info: finished.map(|f| to_finish_info(f, token_ids)),
+        routed_experts: finished.and_then(|f| f.routed_experts.as_ref()).map(|routed| {
+            pb::RoutedExperts {
+                data: routed.data.clone(),
+                shape: routed
+                    .shape
+                    .iter()
+                    .map(|dimension| {
+                        u32::try_from(*dimension)
+                            .expect("routed-experts dimensions must fit in uint32")
+                    })
+                    .collect(),
+                dtype: routed.dtype.clone(),
+                start: opts.routed_experts_prompt_start.unwrap_or(0),
+            }
+        }),
     }
 }
 
@@ -555,6 +685,7 @@ pub struct ResponseOpts {
     pub output_text: bool,
     pub output_token_ids: bool,
     pub output_logprobs: bool,
+    pub routed_experts_prompt_start: Option<u32>,
 }
 
 impl ResponseOpts {
@@ -566,6 +697,7 @@ impl ResponseOpts {
                 output_text: r.output_text.unwrap_or(true),
                 output_token_ids: r.output_token_ids,
                 output_logprobs: r.output_logprobs,
+                routed_experts_prompt_start: r.routed_experts_prompt_start,
             },
             None => Self {
                 output_text: true,
@@ -578,6 +710,7 @@ impl ResponseOpts {
 #[cfg(test)]
 mod tests {
     use vllm_engine_core_client::protocol::output::StopReason;
+    use vllm_engine_core_client::protocol::routed_experts::RoutedExperts;
     use vllm_text::{FinishReason, Finished, Prompt};
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
@@ -664,6 +797,19 @@ mod tests {
         assert!(matches!(text.prompt, Prompt::Text(s) if s == "hi"));
     }
 
+    #[test]
+    fn routed_experts_prompt_start_is_forwarded_to_sampling_params() {
+        let req = pb::GenerateRequest {
+            response: Some(pb::ResponseOptions {
+                routed_experts_prompt_start: Some(3),
+                ..Default::default()
+            }),
+            ..base_request()
+        };
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        assert_eq!(text.sampling_params.routed_experts_prompt_start, Some(3));
+    }
+
     fn finished(reason: FinishReason) -> Finished {
         Finished {
             usage: vllm_llm::TokenUsage {
@@ -674,6 +820,7 @@ mod tests {
             finish_reason: reason,
             kv_transfer_params: None,
             ec_transfer_params: None,
+            routed_experts: None,
         }
     }
 
@@ -756,5 +903,26 @@ mod tests {
         let finish = out.finish_info.expect("finish_info should be present");
         assert_eq!(finish.finish_reason, PbFinishReason::Stop as i32);
         assert_eq!(finish.stop_reason, Some(PbStopReason::EosTokenId(30)));
+    }
+
+    #[test]
+    fn terminal_sequence_output_carries_compact_routed_experts() {
+        let mut fin = finished(FinishReason::Length);
+        fin.routed_experts = Some(RoutedExperts {
+            dtype: "uint8".to_string(),
+            shape: vec![2, 1, 2],
+            data: vec![1, 2, 3, 4],
+        });
+        let opts = ResponseOpts {
+            routed_experts_prompt_start: Some(7),
+            ..Default::default()
+        };
+
+        let out = to_sequence_output("", &[10], None, Some(&fin), &opts);
+        let routed = out.routed_experts.expect("routed experts");
+        assert_eq!(routed.dtype, "uint8");
+        assert_eq!(routed.shape, [2, 1, 2]);
+        assert_eq!(routed.data, [1, 2, 3, 4]);
+        assert_eq!(routed.start, 7);
     }
 }

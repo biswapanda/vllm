@@ -76,21 +76,43 @@ impl InferenceServiceImpl {
             text_request.arrival_time = Some(arrival_time);
             text_request.data_parallel_rank = data_parallel_rank;
 
-            let media = convert::media_parts_from_request(media)?;
-            if !media.is_empty() {
-                let Prompt::TokenIds(mut token_ids) = text_request.prompt else {
-                    return Err(Status::invalid_argument(
-                        "multimodal gRPC requests must provide token_ids input",
-                    ));
-                };
-                let mm_features = self
-                    .state
-                    .chat
-                    .prepare_media(media, &mut token_ids)
-                    .await
-                    .map_err(|error| Status::internal(error.to_report_string()))?;
-                text_request.prompt = Prompt::TokenIds(token_ids);
-                text_request.mm_features = mm_features;
+            match convert::multimodal_input_from_request(media)? {
+                convert::GrpcMultimodalInput::None => {}
+                convert::GrpcMultimodalInput::Raw(media) => {
+                    let Prompt::TokenIds(mut token_ids) = text_request.prompt else {
+                        return Err(Status::invalid_argument(
+                            "multimodal gRPC requests must provide token_ids input",
+                        ));
+                    };
+                    let mm_features = self
+                        .state
+                        .chat
+                        .prepare_media(media, &mut token_ids)
+                        .await
+                        .map_err(|error| Status::internal(error.to_report_string()))?;
+                    text_request.prompt = Prompt::TokenIds(token_ids);
+                    text_request.mm_features = mm_features;
+                }
+                convert::GrpcMultimodalInput::Preprocessed(features) => {
+                    let Prompt::TokenIds(token_ids) = &text_request.prompt else {
+                        return Err(Status::invalid_argument(
+                            "multimodal gRPC requests must provide token_ids input",
+                        ));
+                    };
+                    for (index, feature) in features.iter().enumerate() {
+                        feature
+                            .mm_position
+                            .offset
+                            .checked_add(feature.mm_position.length)
+                            .filter(|end| *end <= token_ids.len())
+                            .ok_or_else(|| {
+                                Status::invalid_argument(format!(
+                                    "media[{index}].features placeholder range exceeds token_ids"
+                                ))
+                            })?;
+                    }
+                    text_request.mm_features = Some(features);
+                }
             }
 
             Ok(text_request)
@@ -185,6 +207,7 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
             finish_reason: collected.finish_reason,
             kv_transfer_params: collected.kv_transfer_params,
             ec_transfer_params: collected.ec_transfer_params,
+            routed_experts: collected.routed_experts,
         };
 
         let outputs = convert::to_sequence_output(
