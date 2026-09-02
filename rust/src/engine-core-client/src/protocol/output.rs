@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 
+use bytes::Bytes;
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_default::DefaultFromSerde;
@@ -12,6 +13,7 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 use super::utility::UtilityOutput;
 use crate::error::{Error, Result, ext_value_decode};
 use crate::protocol::logprobs::MaybeWireLogprobs;
+use crate::protocol::routed_experts::MaybeWireRoutedExperts;
 use crate::protocol::stats::{PrefillStats, SchedulerStats};
 use crate::protocol::{OpaqueValue, decode_msgpack};
 
@@ -108,7 +110,7 @@ pub struct EngineCoreOutput {
     #[serde(default)]
     pub prefill_stats: Option<PrefillStats>,
     #[serde(default)]
-    pub routed_experts: Option<OpaqueValue>,
+    pub routed_experts: Option<MaybeWireRoutedExperts>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     #[serde(default)]
     pub num_nans_in_logits: u32,
@@ -125,6 +127,11 @@ pub struct EngineCoreOutput {
     pub mm_cache_miss_hashes: Option<Vec<String>>,
     #[serde(default)]
     pub new_sampling_mask: Option<OpaqueValue>,
+    /// Per-request speculative-decoding acceptance metrics, set on the final
+    /// output when `--per-request-spec-decode-metrics` is enabled. Opaque here;
+    /// the Rust frontend does not yet surface it in responses.
+    #[serde(default)]
+    pub spec_decode_metrics: Option<OpaqueValue>,
 }
 
 impl EngineCoreOutput {
@@ -135,16 +142,15 @@ impl EngineCoreOutput {
 
     /// Resolve all wire-format fields in-place by looking up aux frames and
     /// decoding raw-view payloads as needed.
-    fn resolve_in_place<Frame>(&mut self, frames: &[Frame]) -> Result<()>
-    where
-        Frame: AsRef<[u8]>,
-    {
+    fn resolve_in_place(&mut self, frames: &[Bytes]) -> Result<()> {
         self.new_logprobs = (self.new_logprobs.take())
             .map(|value| value.resolve(frames, "new_logprobs"))
             .transpose()?;
         self.new_prompt_logprobs_tensors = (self.new_prompt_logprobs_tensors.take())
             .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
             .transpose()?;
+        self.routed_experts =
+            (self.routed_experts.take()).map(|value| value.resolve(frames)).transpose()?;
         Ok(())
     }
 }
@@ -241,10 +247,7 @@ impl From<DpControlOutput> for EngineCoreOutputs {
 impl EngineCoreOutputs {
     /// Resolve all wire-format fields in-place by looking up aux frames and
     /// decoding raw-view payloads as needed.
-    fn resolve_in_place<Frame>(&mut self, frames: &[Frame]) -> Result<()>
-    where
-        Frame: AsRef<[u8]>,
-    {
+    fn resolve_in_place(&mut self, frames: &[Bytes]) -> Result<()> {
         if let Self::RequestBatch(batch) = self {
             for output in &mut batch.outputs {
                 output.resolve_in_place(frames)?;
@@ -360,10 +363,7 @@ impl<'de> Deserialize<'de> for EngineCoreOutputs {
 
 /// Decode one ordinary or multipart engine-core output message into the strong
 /// typed public protocol shape.
-pub fn decode_engine_core_outputs<Frame>(frames: &[Frame]) -> Result<EngineCoreOutputs>
-where
-    Frame: AsRef<[u8]>,
-{
+pub fn decode_engine_core_outputs(frames: &[Bytes]) -> Result<EngineCoreOutputs> {
     let first_frame = frames.first().ok_or_else(|| ext_value_decode!("missing output frame"))?;
 
     let mut outputs: EngineCoreOutputs = decode_msgpack(first_frame.as_ref())?;
@@ -443,6 +443,7 @@ mod tests {
                             num_nans_in_logits: 0,
                             mm_cache_miss_hashes: None,
                             new_sampling_mask: None,
+                            spec_decode_metrics: None,
                         },
                     ],
                     scheduler_stats: None,
